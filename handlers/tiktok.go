@@ -286,20 +286,27 @@ func (h *TikTokHandler) GetUserInfo(c *gin.Context) {
 		return
 	}
 
-	// 에러 체크
+	// 에러 체크 - TikTok API는 error.code가 "ok"일 때도 에러 객체를 반환함
 	if errorData, ok := result["error"]; ok {
-		fmt.Printf("❌ TikTok API Error: %v\n", errorData)
-		c.JSON(http.StatusBadRequest, gin.H{"error": errorData})
-		return
+		if errorMap, isMap := errorData.(map[string]interface{}); isMap {
+			// code가 "ok"가 아닌 경우만 에러로 처리
+			if code, hasCode := errorMap["code"]; hasCode && code != "ok" {
+				fmt.Printf("❌ TikTok API Error: %v\n", errorData)
+				c.JSON(http.StatusBadRequest, gin.H{"error": errorData})
+				return
+			}
+		}
 	}
 
-	// 성공적인 응답
+	// 성공적인 응답 처리
+	// TikTok API v2는 data.user 구조로 반환
 	if data, ok := result["data"].(map[string]interface{}); ok {
 		if user, ok := data["user"].(map[string]interface{}); ok {
 			fmt.Println("\n📊 ===== TikTok User Data =====")
 			fmt.Printf("  OpenID: %v\n", user["open_id"])
 			fmt.Printf("  DisplayName: %v\n", user["display_name"])
 			fmt.Printf("  AvatarURL: %v\n", user["avatar_url"])
+			fmt.Printf("  UnionID: %v\n", user["union_id"])
 			fmt.Println("================================\n")
 			
 			c.JSON(http.StatusOK, gin.H{"data": user})
@@ -307,9 +314,18 @@ func (h *TikTokHandler) GetUserInfo(c *gin.Context) {
 		}
 	}
 
-	// 예상치 못한 응답 구조
-	fmt.Printf("⚠️ Unexpected response structure\n")
-	c.JSON(http.StatusOK, gin.H{"data": result})
+	// data가 없거나 비어있는 경우 - 기본 사용자 정보 반환
+	fmt.Printf("⚠️ No user data in response, using basic info from token\n")
+	
+	// 토큰에서 기본 정보 추출
+	basicUser := map[string]interface{}{
+		"open_id": userToken.OpenID,
+		"display_name": "TikTok User",
+		"avatar_url": "",
+		"union_id": "",
+	}
+	
+	c.JSON(http.StatusOK, gin.H{"data": basicUser})
 }
 
 // 5. 비디오 목록 조회

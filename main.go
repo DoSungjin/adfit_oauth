@@ -50,6 +50,7 @@ func main() {
     
     // Handler 초기화
     tiktokHandler := &handlers.TikTokHandler{DB: db}
+    youtubeHandler := handlers.NewYouTubeHandler(db)
     
     // 공개 라우트
     public := r.Group("/api/tiktok")
@@ -59,7 +60,7 @@ func main() {
         public.POST("/token", tiktokHandler.ExchangeToken)      // 토큰 교환
     }
     
-    // 인증 필요 라우트
+    // TikTok 인증 필요 라우트
     protected := r.Group("/api/tiktok")
     protected.Use(middleware.AuthRequired())
     {
@@ -67,6 +68,24 @@ func main() {
         protected.GET("/videos", tiktokHandler.GetVideos)       // 비디오 목록
         protected.POST("/refresh", tiktokHandler.RefreshToken)  // 토큰 갱신
         protected.POST("/logout", tiktokHandler.Logout)         // 로그아웃
+    }
+    
+    // YouTube 공개 라우트
+    youtubePublic := r.Group("/api/youtube")
+    {
+        youtubePublic.GET("/auth", youtubeHandler.GetAuthURL)           // 로그인 URL 생성
+        youtubePublic.GET("/callback", youtubeHandler.HandleCallback)   // OAuth 콜백
+        youtubePublic.POST("/token", youtubeHandler.ExchangeToken)      // 토큰 교환
+    }
+    
+    // YouTube 인증 필요 라우트
+    youtubeProtected := r.Group("/api/youtube")
+    youtubeProtected.Use(middleware.AuthRequired())
+    {
+        youtubeProtected.GET("/user", youtubeHandler.GetUserInfo)       // 사용자 정보
+        youtubeProtected.GET("/videos", youtubeHandler.GetVideos)       // 비디오 목록
+        youtubeProtected.POST("/refresh", youtubeHandler.RefreshToken)  // 토큰 갱신
+        youtubeProtected.POST("/logout", youtubeHandler.Logout)         // 로그아웃
     }
     
     // Health check

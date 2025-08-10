@@ -9,6 +9,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.2.0
 	github.com/joho/godotenv v1.5.1
 	golang.org/x/oauth2 v0.16.0
+	google.golang.org/api v0.156.0
 	gorm.io/gorm v1.25.6
 )
 

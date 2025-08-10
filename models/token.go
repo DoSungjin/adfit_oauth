@@ -7,13 +7,16 @@ import (
 
 type UserToken struct {
     gorm.Model
-    UserID       string    `gorm:"uniqueIndex;not null"`
+    UserID       string    `gorm:"index;not null"`  // uniqueIndex 제거 (platform과 함께 사용)
+    Platform     string    `gorm:"index;not null;default:'tiktok'"` // 'tiktok' or 'youtube'
     AccessToken  string    `gorm:"not null"`
     RefreshToken string    
     TokenType    string    
     ExpiresAt    time.Time
     Scope        string
     OpenID       string    // TikTok user open_id
+    ChannelID    string    // YouTube channel ID
+    UpdatedAt    time.Time
 }
 
 type TikTokUser struct {

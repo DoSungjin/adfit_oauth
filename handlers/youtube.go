@@ -127,24 +127,34 @@ func (h *YouTubeHandler) ExchangeToken(c *gin.Context) {
 	// 채널 정보 가져오기
 	channelsResponse, err := youtubeService.Channels.List([]string{"snippet", "statistics"}).Mine(true).Do()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get channel info"})
-		return
+		fmt.Printf("❌ Failed to get channel info: %v\n", err)
+		// 채널 정보를 가져오지 못해도 토큰은 반환
 	}
 
 	var channelInfo map[string]interface{}
-	if len(channelsResponse.Items) > 0 {
+	if channelsResponse != nil && len(channelsResponse.Items) > 0 {
 		channel := channelsResponse.Items[0]
 		channelInfo = map[string]interface{}{
 			"id":          channel.Id,
-			"title":       channel.Snippet.Title,
-			"description": channel.Snippet.Description,
-			"thumbnail":   channel.Snippet.Thumbnails.Default.Url,
+			"snippet": map[string]interface{}{
+				"title":       channel.Snippet.Title,
+				"description": channel.Snippet.Description,
+				"thumbnails": map[string]interface{}{
+					"default": map[string]interface{}{
+						"url": channel.Snippet.Thumbnails.Default.Url,
+					},
+				},
+			},
 			"statistics": map[string]interface{}{
 				"subscriberCount": channel.Statistics.SubscriberCount,
 				"videoCount":      channel.Statistics.VideoCount,
 				"viewCount":       channel.Statistics.ViewCount,
 			},
+			"connected": true,
 		}
+		fmt.Printf("✅ Channel info retrieved: %s\n", channel.Snippet.Title)
+	} else {
+		fmt.Printf("⚠️ No channel found for user\n")
 	}
 
 	// 토큰 저장
@@ -179,9 +189,10 @@ func (h *YouTubeHandler) ExchangeToken(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"access_token": tokenString,
-		"channel_info": channelInfo,
-		"expires_in":   86400,
+		"session_token": tokenString,  // Flutter 앱에서 session_token으로 받음
+		"access_token":  tokenString,  // 호환성을 위해 둘 다 제공
+		"channel_info":  channelInfo,
+		"expires_in":    86400,
 	})
 }
 
@@ -365,7 +376,70 @@ func (h *YouTubeHandler) RefreshToken(c *gin.Context) {
 	})
 }
 
-// 7. 로그아웃
+// 7. 채널 정보 조회 (간단한 버전)
+func (h *YouTubeHandler) GetChannelInfo(c *gin.Context) {
+	userID := c.GetString("user_id")
+
+	var userToken models.UserToken
+	if err := h.DB.Where("user_id = ? AND platform = ?", userID, "youtube").First(&userToken).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "YouTube not connected"})
+		return
+	}
+
+	// OAuth2 토큰 복원
+	token := &oauth2.Token{
+		AccessToken:  userToken.AccessToken,
+		RefreshToken: userToken.RefreshToken,
+		Expiry:       userToken.ExpiresAt,
+	}
+
+	// YouTube 서비스 초기화
+	ctx := context.Background()
+	client := h.oauth2Config.Client(ctx, token)
+	youtubeService, err := youtube.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create YouTube service"})
+		return
+	}
+
+	// 채널 정보 가져오기
+	channelsResponse, err := youtubeService.Channels.List([]string{"snippet", "statistics"}).Mine(true).Do()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get channel info"})
+		return
+	}
+
+	if len(channelsResponse.Items) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "No channel found"})
+		return
+	}
+
+	channel := channelsResponse.Items[0]
+	channelInfo := map[string]interface{}{
+		"id":          channel.Id,
+		"snippet": map[string]interface{}{
+			"title":       channel.Snippet.Title,
+			"description": channel.Snippet.Description,
+			"thumbnails": map[string]interface{}{
+				"default": map[string]interface{}{
+					"url": channel.Snippet.Thumbnails.Default.Url,
+				},
+			},
+		},
+		"statistics": map[string]interface{}{
+			"subscriberCount": channel.Statistics.SubscriberCount,
+			"videoCount":      channel.Statistics.VideoCount,
+			"viewCount":       channel.Statistics.ViewCount,
+		},
+		"connected": true,
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"channel": channelInfo,
+	})
+}
+
+// 8. 로그아웃
 func (h *YouTubeHandler) Logout(c *gin.Context) {
 	userID := c.GetString("user_id")
 

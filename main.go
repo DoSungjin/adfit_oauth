@@ -83,7 +83,9 @@ func main() {
     youtubeProtected.Use(middleware.AuthRequired())
     {
         youtubeProtected.GET("/user", youtubeHandler.GetUserInfo)       // 사용자 정보
+        youtubeProtected.GET("/channel", youtubeHandler.GetChannelInfo) // 채널 정보 (간단한 버전)
         youtubeProtected.GET("/videos", youtubeHandler.GetVideos)       // 비디오 목록
+        youtubeProtected.GET("/analytics/:videoId", youtubeHandler.GetVideoAnalytics) // 비디오 분석
         youtubeProtected.POST("/refresh", youtubeHandler.RefreshToken)  // 토큰 갱신
         youtubeProtected.POST("/logout", youtubeHandler.Logout)         // 로그아웃
     }

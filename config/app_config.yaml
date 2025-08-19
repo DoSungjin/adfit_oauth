@@ -1,0 +1,140 @@
+# AdFit OAuth Server Configuration
+app:
+  name: "AdFit OAuth Server"
+  version: "1.0.0"
+  environment: "development"  # development, staging, production
+  port: "8080"
+  debug: true
+
+# Database Configuration
+database:
+  type: "sqlite"
+  path: "adfit.db"
+  # For PostgreSQL/MySQL (future)
+  # host: "localhost"
+  # port: 5432
+  # user: "adfit"
+  # password: "password"
+  # dbname: "adfit"
+
+# Firebase Configuration  
+firebase:
+  project_id: "posted-app-c4ff5"
+  credentials_path: ""  # 환경변수로 설정: GOOGLE_APPLICATION_CREDENTIALS
+
+# OAuth Providers
+oauth:
+  tiktok:
+    client_id: ""       # 환경변수: TIKTOK_CLIENT_KEY
+    client_secret: ""   # 환경변수: TIKTOK_CLIENT_SECRET
+    redirect_uri: "https://adfit-oauth-server-520676604613.asia-northeast3.run.app/api/tiktok/callback"
+    scopes:
+      - "user.info.basic"
+      - "video.list"
+    auth_url: "https://www.tiktok.com/v2/auth/authorize"
+    token_url: "https://open.tiktokapis.com/v2/oauth/token/"
+  
+  youtube:
+    client_id: ""       # 환경변수: YOUTUBE_CLIENT_ID
+    client_secret: ""   # 환경변수: YOUTUBE_CLIENT_SECRET
+    redirect_uri: "https://adfit-oauth-server-520676604613.asia-northeast3.run.app/api/youtube/callback"
+    scopes:
+      - "https://www.googleapis.com/auth/youtube.readonly"
+      - "https://www.googleapis.com/auth/yt-analytics.readonly"
+    api_key: ""         # 환경변수: YOUTUBE_API_KEY
+
+# CORS Configuration
+cors:
+  allowed_origins:
+    - "https://adfit.ai"
+    - "https://posted-app-c4ff5.web.app"
+    - "http://localhost:9000"
+    - "http://localhost:3000"
+  allowed_methods:
+    - "GET"
+    - "POST" 
+    - "PUT"
+    - "DELETE"
+    - "OPTIONS"
+  allowed_headers:
+    - "Origin"
+    - "Content-Type"
+    - "Authorization"
+  expose_headers:
+    - "Content-Length"
+  allow_credentials: false
+
+# Statistics Service Configuration
+stats:
+  update_token: "adfit-stats-update-token"  # 환경변수: STATS_UPDATE_TOKEN
+  youtube_api_key: ""                        # 환경변수: YOUTUBE_API_KEY
+  batch_size: 50                            # YouTube API 배치 크기
+  
+# Cron Job Schedules
+cron:
+  enabled: true
+  schedules:
+    hourly_stats: "0 0 * * * *"      # 매시간 0분
+    daily_stats: "0 0 2 * * *"       # 매일 오전 2시
+    weekly_cleanup: "0 0 1 * * 0"    # 매주 일요일 오전 1시
+
+# Logging Configuration
+logging:
+  level: "info"        # debug, info, warn, error
+  format: "json"       # json, text
+  output: "stdout"     # stdout, file
+  file_path: "logs/app.log"
+
+# Security Configuration
+security:
+  jwt_secret: ""       # 환경변수: JWT_SECRET
+  token_ttl: "24h"     # JWT 토큰 유효시간
+  rate_limit:
+    requests_per_minute: 60
+    burst: 10
+
+# Feature Flags
+features:
+  tiktok_enabled: true
+  youtube_enabled: true
+  stats_enabled: true
+  cron_enabled: true
+  analytics_enabled: false
+
+# Environment Specific Overrides
+environments:
+  development:
+    app:
+      debug: true
+      port: "8080"
+    cors:
+      allowed_origins:
+        - "http://localhost:9000"
+        - "http://localhost:3000"
+    logging:
+      level: "debug"
+      format: "text"
+  
+  staging:
+    app:
+      debug: false
+      port: "8080"
+    cors:
+      allowed_origins:
+        - "https://staging.adfit.ai"
+    logging:
+      level: "info"
+      format: "json"
+  
+  production:
+    app:
+      debug: false
+      port: "8080"
+    cors:
+      allowed_origins:
+        - "https://adfit.ai"
+    logging:
+      level: "warn"
+      format: "json"
+    features:
+      analytics_enabled: true

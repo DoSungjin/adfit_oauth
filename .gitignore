@@ -55,3 +55,8 @@ api-config.yaml
 
 # Backup files
 *.bak
+
+# Secret files
+*.secret
+deploy_with_youtube.bat
+*_with_secrets.*

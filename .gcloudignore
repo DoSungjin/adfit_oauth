@@ -1,0 +1,73 @@
+# .gcloudignore - Cloud Run 배포 시 제외할 파일/폴더
+
+# 테스트 폴더
+test/
+tests/
+
+# Python 파일 (테스트 스크립트)
+*.py
+*.pyc
+requirements.txt
+config_youtube.yaml
+
+# 개발 전용 파일
+*.db
+*.db-shm
+*.db-wal
+adfit.db
+
+# 민감 정보
+*.json
+service-account-key.json
+credentials.json
+*.pem
+*.key
+
+# 로그 파일
+logs/
+*.log
+
+# 임시 파일
+tmp/
+temp/
+*.tmp
+
+# IDE 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS 파일
+.DS_Store
+Thumbs.db
+
+# Git 관련
+.git/
+.gitignore
+.gitattributes
+
+# 문서
+README.md
+docs/
+*.md
+
+# 백업 파일
+*.bak
+*.backup
+backup/
+
+# Node modules (혹시 있다면)
+node_modules/
+
+# Python (테스트 스크립트용)
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.env
+
+# Go 테스트 파일
+*_test.go

@@ -1,0 +1,71 @@
+# .gitignore - Git 저장소에서 제외할 파일
+
+# 바이너리
+adfit-server
+*.exe
+
+# 데이터베이스
+*.db
+*.db-shm
+*.db-wal
+adfit.db
+
+# 민감 정보
+*.json
+service-account-key.json
+credentials.json
+firebase-key.json
+*.pem
+*.key
+
+# 환경 변수 (실제 값)
+.env
+.env.local
+.env.production
+.env.yaml
+deploy.yaml
+env_no_port.yaml
+deploy_complete.bat
+deploy_no_port.bat
+deploy_production.ps1
+
+# 로그
+logs/
+*.log
+
+# 임시 파일
+tmp/
+temp/
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+*.out
+
+# Python (테스트 스크립트)
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.Python
+
+# 백업
+*.bak
+*.backup
+backup/
+
+# 테스트 출력
+test/output/
+test/*.json
+test/*.xlsx

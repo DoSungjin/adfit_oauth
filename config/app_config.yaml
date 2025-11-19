@@ -74,7 +74,7 @@ stats:
 cron:
   enabled: true
   schedules:
-    hourly_stats: "0 0 * * * *"      # 매시간 0분
+    hourly_stats: "0 0 * * * *"      # 매시간 정시
     daily_stats: "0 0 2 * * *"       # 매일 오전 2시
     weekly_cleanup: "0 0 1 * * 0"    # 매주 일요일 오전 1시
 

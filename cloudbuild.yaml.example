@@ -1,0 +1,71 @@
+# Cloud Build 설정 파일 (템플릿)
+# 사용법:
+#   1. 이 파일을 복사하여 cloudbuild.yaml 생성
+#   2. YOUR_XXX를 실제 값으로 변경
+#   3. gcloud builds submit --config cloudbuild.yaml 실행
+#
+# ⚠️ 보안 권장: Secret Manager 사용을 권장합니다!
+#    https://cloud.google.com/build/docs/securing-builds/use-secrets
+
+steps:
+  # 1단계: Docker 이미지 빌드 (캐시 활용)
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--cache-from'
+      - 'gcr.io/$PROJECT_ID/adfit-server:latest'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/adfit-server:$SHORT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/adfit-server:latest'
+      - '.'
+    id: 'build-image'
+
+  # 2단계: 이미지 푸시
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/adfit-server:$SHORT_SHA'
+    id: 'push-image'
+
+  # 3단계: Cloud Run 배포
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'adfit-server'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/adfit-server:$SHORT_SHA'
+      - '--region'
+      - 'asia-northeast3'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--memory'
+      - '512Mi'
+      - '--cpu'
+      - '1'
+      - '--timeout'
+      - '300'
+      - '--max-instances'
+      - '10'
+      - '--min-instances'
+      - '0'
+      - '--update-env-vars'
+      # ⭐ 아래 YOUR_XXX를 실제 값으로 변경하세요!
+      - 'YOUTUBE_CLIENT_ID=YOUR_YOUTUBE_CLIENT_ID,YOUTUBE_CLIENT_SECRET=YOUR_YOUTUBE_CLIENT_SECRET,YOUTUBE_API_KEY=YOUR_YOUTUBE_API_KEY,YOUTUBE_REDIRECT_URI=https://adfit-server-520676604613.asia-northeast3.run.app/api/youtube/callback,TIKTOK_CLIENT_KEY=YOUR_TIKTOK_CLIENT_KEY,TIKTOK_CLIENT_SECRET=YOUR_TIKTOK_CLIENT_SECRET,TIKTOK_REDIRECT_URI=https://adfit-server-520676604613.asia-northeast3.run.app/api/tiktok/callback,STATS_UPDATE_TOKEN=YOUR_STATS_UPDATE_TOKEN,FIREBASE_PROJECT_ID=YOUR_FIREBASE_PROJECT_ID,FIREBASE_DATABASE_URL=https://YOUR_PROJECT_ID.firebaseio.com,ENV=production'
+    id: 'deploy-cloudrun'
+
+# 최종 이미지들
+images:
+  - 'gcr.io/$PROJECT_ID/adfit-server:$SHORT_SHA'
+  - 'gcr.io/$PROJECT_ID/adfit-server:latest'
+
+# 타임아웃 설정
+timeout: '1200s'  # 20분
+
+# 빌드 옵션
+options:
+  machineType: 'E2_HIGHCPU_8'  # 빌드 속도 향상
+  logging: CLOUD_LOGGING_ONLY

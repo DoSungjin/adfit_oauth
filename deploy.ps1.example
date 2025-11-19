@@ -1,0 +1,56 @@
+# 🚀 AdFit Server - Cloud Run 배포 스크립트 (PowerShell)
+# 사용법: 
+#   1. 이 파일을 복사하여 deploy.ps1 생성
+#   2. 아래 환경 변수를 실제 값으로 변경
+#   3. .\deploy.ps1 실행
+
+Write-Host "🔍 배포 전 체크..." -ForegroundColor Cyan
+
+# 1. 불필요한 파일 삭제
+Write-Host "🧹 임시 파일 정리 중..." -ForegroundColor Yellow
+Remove-Item -Path "adfit.db", "main.exe", "adfit-server" -ErrorAction SilentlyContinue
+
+# 2. Go 모듈 정리
+Write-Host "📦 Go 모듈 검증 중..." -ForegroundColor Yellow
+go mod tidy
+
+Write-Host ""
+Write-Host "🚀 Cloud Run 배포 시작..." -ForegroundColor Green
+Write-Host "📍 Region: asia-northeast3" -ForegroundColor White
+Write-Host "📦 Service: adfit-server" -ForegroundColor White
+Write-Host ""
+
+# ⭐ 환경 변수 설정
+$YOUTUBE_CLIENT_ID = "YOUR_YOUTUBE_CLIENT_ID"
+$YOUTUBE_CLIENT_SECRET = "YOUR_YOUTUBE_CLIENT_SECRET"
+$YOUTUBE_API_KEY = "YOUR_YOUTUBE_API_KEY"
+$YOUTUBE_REDIRECT_URI = "https://adfit-server-520676604613.asia-northeast3.run.app/api/youtube/callback"
+
+$TIKTOK_CLIENT_KEY = "YOUR_TIKTOK_CLIENT_KEY"
+$TIKTOK_CLIENT_SECRET = "YOUR_TIKTOK_CLIENT_SECRET"
+$TIKTOK_REDIRECT_URI = "https://adfit-server-520676604613.asia-northeast3.run.app/api/tiktok/callback"
+
+$STATS_UPDATE_TOKEN = "YOUR_STATS_UPDATE_TOKEN"
+$FIREBASE_PROJECT_ID = "YOUR_FIREBASE_PROJECT_ID"
+$FIREBASE_DATABASE_URL = "https://YOUR_PROJECT_ID.firebaseio.com"
+$ENV = "production"
+
+# 환경 변수 문자열 생성
+$ENV_VARS = "YOUTUBE_CLIENT_ID=$YOUTUBE_CLIENT_ID,YOUTUBE_CLIENT_SECRET=$YOUTUBE_CLIENT_SECRET,YOUTUBE_API_KEY=$YOUTUBE_API_KEY,YOUTUBE_REDIRECT_URI=$YOUTUBE_REDIRECT_URI,TIKTOK_CLIENT_KEY=$TIKTOK_CLIENT_KEY,TIKTOK_CLIENT_SECRET=$TIKTOK_CLIENT_SECRET,TIKTOK_REDIRECT_URI=$TIKTOK_REDIRECT_URI,STATS_UPDATE_TOKEN=$STATS_UPDATE_TOKEN,FIREBASE_PROJECT_ID=$FIREBASE_PROJECT_ID,FIREBASE_DATABASE_URL=$FIREBASE_DATABASE_URL,ENV=$ENV"
+
+# 4. Cloud Run 배포
+gcloud run deploy adfit-server `
+  --source . `
+  --region=asia-northeast3 `
+  --allow-unauthenticated `
+  --platform=managed `
+  --memory=512Mi `
+  --cpu=1 `
+  --timeout=300 `
+  --max-instances=10 `
+  --min-instances=0 `
+  --update-env-vars="$ENV_VARS"
+
+Write-Host ""
+Write-Host "✅ 배포 완료!" -ForegroundColor Green
+Write-Host "🌐 URL: https://adfit-server-520676604613.asia-northeast3.run.app" -ForegroundColor Cyan

@@ -1,6 +1,7 @@
 # Git
 .git
 .gitignore
+.gcloudignore
 
 # IDE
 .vscode
@@ -8,11 +9,31 @@
 *.swp
 *.swo
 
-# Build artifacts
+# Build artifacts (⭐ 중요!)
 *.exe
 *.test
 *.out
 main
+main.exe
+adfit-server
+
+# Database files (⭐ 가장 중요!)
+*.db
+*.db-shm
+*.db-wal
+adfit.db
+
+# Environment files
+.env
+.env.yaml
+.env.example
+
+# Config files with credentials
+config/*.yaml
+service-account-key.json
+*.json
+!go.mod
+!go.sum
 
 # Documentation
 README.md
@@ -21,9 +42,11 @@ README.md
 # Test files
 *_test.go
 test/
+tests/
 
 # Logs
 *.log
+logs/
 
 # OS files
 .DS_Store
@@ -32,3 +55,17 @@ Thumbs.db
 # Temporary files
 *.tmp
 tmp/
+temp/
+
+# Vercel
+.vercel/
+vercel.json
+
+# Python scripts (테스트용)
+*.py
+*.pyc
+requirements.txt
+
+# Deployment examples
+deploy.yaml.example
+Procfile

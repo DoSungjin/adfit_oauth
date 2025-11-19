@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/firestore"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"gorm.io/gorm"
@@ -20,7 +22,8 @@ import (
 )
 
 type TikTokHandler struct {
-	DB *gorm.DB
+	DB        *gorm.DB
+	Firestore *firestore.Client
 }
 
 // GetAuthURL generates TikTok OAuth authorization URL
@@ -663,4 +666,121 @@ func extractUserIDFromState(state string) string {
 
 	// 그대로 반환
 	return state
+}
+
+// SubmitVideo handles TikTok video submission and stores it in Firestore
+func (h *TikTokHandler) SubmitVideo(c *gin.Context) {
+	// Firebase Auth로 인증된 사용자 ID
+	userID := c.GetString("user_id")
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	// 요청 바디 파싱
+	var req struct {
+		CompetitionID string `json:"competitionId" binding:"required"`
+		VideoID       string `json:"videoId" binding:"required"`
+		VideoURL      string `json:"videoUrl" binding:"required"`
+		VideoTitle    string `json:"videoTitle"`
+		ThumbnailURL  string `json:"thumbnailUrl"`
+		ViewCount     int    `json:"viewCount"`
+		LikeCount     int    `json:"likeCount"`
+		CommentCount  int    `json:"commentCount"`
+		ShareCount    int    `json:"shareCount"`
+		CreatorName   string `json:"creatorName"`
+		JWT           string `json:"jwt" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
+		return
+	}
+
+	fmt.Printf("🎯 TikTok Video Submission - User: %s, Competition: %s, Video: %s\n",
+		userID, req.CompetitionID, req.VideoID)
+
+	// JWT 검증 (TikTok OpenID 추출)
+	token, err := jwt.Parse(req.JWT, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return []byte(os.Getenv("JWT_SECRET")), nil
+	})
+
+	if err != nil || !token.Valid {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid JWT"})
+		return
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid JWT claims"})
+		return
+	}
+
+	openID, _ := claims["open_id"].(string)
+
+	// Firestore에 저장할 데이터 준비
+	ctx := context.Background()
+	submissionRef := h.Firestore.Collection("competitions").Doc(req.CompetitionID).
+		Collection("submissions").NewDoc()
+
+	submissionData := map[string]interface{}{
+		"competitionId": req.CompetitionID,
+		"creatorId":     userID,
+		"creatorName":   req.CreatorName,
+		"videoUrl":      req.VideoURL,
+		"videoTitle":    req.VideoTitle,
+		"thumbnailUrl":  req.ThumbnailURL,
+		"viewCount":     req.ViewCount,
+		"likeCount":     req.LikeCount,
+		"commentCount":  req.CommentCount,
+		"shareCount":    req.ShareCount,
+		"platform":      "tiktok",
+		"tiktokData": map[string]interface{}{
+			"videoId": req.VideoID,
+		},
+		// ⭐ Token 저장 (조회수 업데이트용)
+		"tiktokAuth": map[string]interface{}{
+			"jwt":     req.JWT,
+			"openId":  openID,
+			"savedAt": time.Now().Format(time.RFC3339),
+		},
+		"submittedAt":  firestore.ServerTimestamp,
+		"isWinner":     false,
+		"hasAnalytics": false,
+		"isDeleted":    "n",
+	}
+
+	// Firestore Batch 작업
+	batch := h.Firestore.Batch()
+
+	// 1. submission 저장
+	batch.Set(submissionRef, submissionData)
+
+	// 2. participant 업데이트
+	participantRef := h.Firestore.Collection("competitions").Doc(req.CompetitionID).
+		Collection("participants").Doc(userID)
+
+	batch.Update(participantRef, []firestore.Update{
+		{Path: "submissionCount", Value: firestore.Increment(1)},
+		{Path: "totalViewCount", Value: firestore.Increment(req.ViewCount)},
+		{Path: "lastSubmittedAt", Value: firestore.ServerTimestamp},
+	})
+
+	// Batch 실행
+	if _, err := batch.Commit(ctx); err != nil {
+		fmt.Printf("❌ Firestore batch commit failed: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to submit video"})
+		return
+	}
+
+	fmt.Printf("✅ Video submission saved - Submission ID: %s\n", submissionRef.ID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":      true,
+		"message":      "Video submitted successfully",
+		"submissionId": submissionRef.ID,
+	})
 }

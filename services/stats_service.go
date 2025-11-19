@@ -118,8 +118,6 @@ func (s *StatsService) CheckAndStartApprovedCompetitions() error {
 	ctx := context.Background()
 	now := time.Now()
 
-	log.Println("🌙 [자정 12시] APPROVED → ONGOING 체크 시작")
-
 	// APPROVED 상태 대회 조회
 	iter := s.firestore.Collection("competitions").
 		Where("status", "==", "APPROVED").
@@ -138,22 +136,15 @@ func (s *StatsService) CheckAndStartApprovedCompetitions() error {
 		}
 
 		data := doc.Data()
-		competitionID := doc.Ref.ID
-		competitionName := getStringFromData(data, "title")
 
 		// startDate 확인
 		startDate, ok := data["startDate"].(time.Time)
 		if !ok {
-			log.Printf("⚠️ 대회 %s: startDate 필드 없음", competitionName)
 			continue
 		}
 
 		// startDate가 현재 시간보다 이전이거나 같으면 시작
 		if startDate.Before(now) || startDate.Equal(now) {
-			log.Printf("🚀 대회 시작: %s (ID: %s)", competitionName, competitionID)
-			log.Printf("   - startDate: %s", startDate.Format("2006-01-02 15:04:05"))
-			log.Printf("   - 현재시간: %s", now.Format("2006-01-02 15:04:05"))
-
 			// ONGOING으로 상태 변경
 			_, err := doc.Ref.Update(ctx, []firestore.Update{
 				{Path: "status", Value: "ONGOING"},
@@ -161,16 +152,12 @@ func (s *StatsService) CheckAndStartApprovedCompetitions() error {
 				{Path: "updatedAt", Value: now},
 			})
 
-			if err != nil {
-				log.Printf("❌ 대회 시작 처리 실패: %v", err)
-			} else {
+			if err == nil {
 				startedCount++
-				log.Printf("✅ 대회 시작 완료: %s", competitionName)
 			}
 		}
 	}
 
-	log.Printf("✅ APPROVED → ONGOING 체크 완료: %d개 대회 시작됨", startedCount)
 	return nil
 }
 
@@ -178,8 +165,6 @@ func (s *StatsService) CheckAndStartApprovedCompetitions() error {
 func (s *StatsService) CheckAndFinishOngoingCompetitions() error {
 	ctx := context.Background()
 	now := time.Now()
-
-	log.Println("🌅 [오전 1시] ONGOING → FINISHED 체크 시작")
 
 	// ONGOING 상태 대회 조회
 	iter := s.firestore.Collection("competitions").
@@ -200,41 +185,28 @@ func (s *StatsService) CheckAndFinishOngoingCompetitions() error {
 
 		data := doc.Data()
 		competitionID := doc.Ref.ID
-		competitionName := getStringFromData(data, "title")
 
 		// deadline 확인
 		deadline, ok := data["deadline"].(time.Time)
 		if !ok {
-			log.Printf("⚠️ 대회 %s: deadline 필드 없음", competitionName)
 			continue
 		}
 
 		// deadline이 지났으면 종료 처리
 		if deadline.Before(now) {
-			log.Printf("🏁 대회 종료 처리 시작: %s (ID: %s)", competitionName, competitionID)
-			log.Printf("   - deadline: %s", deadline.Format("2006-01-02 15:04:05"))
-			log.Printf("   - 현재시간: %s", now.Format("2006-01-02 15:04:05"))
-
 			// 종료 처리 (YouTube 데이터 수집 + 우승자 선정)
-			if err := s.finalizeCompetition(ctx, competitionID, competitionName); err != nil {
-				log.Printf("❌ 대회 종료 처리 실패: %s - %v", competitionName, err)
-			} else {
+			if err := s.FinalizeCompetition(competitionID); err == nil {
 				finishedCount++
-				log.Printf("✅ 대회 종료 완료: %s", competitionName)
 			}
 		}
 	}
 
-	log.Printf("✅ ONGOING → FINISHED 체크 완료: %d개 대회 종료됨", finishedCount)
 	return nil
 }
 
 func (s *StatsService) CheckAndCancelPendingCompetitions() error {
 	ctx := context.Background()
 	now := time.Now()
-	oneWeekLater := now.AddDate(0, 0, 7) // 1주일 후
-
-	log.Println("🚫 미승인 대회 취소 체크 시작")
 
 	// REGISTERED, NOTICED, UNDERREVIEW 상태 대회 조회
 	pendingStatuses := []string{"REGISTERED", "NOTICED", "UNDERREVIEW"}
@@ -257,22 +229,15 @@ func (s *StatsService) CheckAndCancelPendingCompetitions() error {
 			}
 
 			data := doc.Data()
-			competitionID := doc.Ref.ID
-			competitionName := getStringFromData(data, "title")
 
 			// startDate 확인
 			startDate, ok := data["startDate"].(time.Time)
 			if !ok {
-				log.Printf("⚠️ 대회 %s: startDate 필드 없음", competitionName)
 				continue
 			}
 
-			// 개최일이 1주일 이내면 취소
-			if startDate.Before(oneWeekLater) {
-				log.Printf("🚫 대회 자동 취소: %s (ID: %s, 상태: %s)", competitionName, competitionID, status)
-				log.Printf("   - startDate: %s", startDate.Format("2006-01-02"))
-				log.Printf("   - 현재+7일: %s", oneWeekLater.Format("2006-01-02"))
-
+			// 개최일이 되었는데도 승인 안 되면 취소
+			if startDate.Before(now) || startDate.Equal(now) {
 				// CANCELLED로 상태 변경
 				_, err := doc.Ref.Update(ctx, []firestore.Update{
 					{Path: "status", Value: "CANCELLED"},
@@ -281,35 +246,34 @@ func (s *StatsService) CheckAndCancelPendingCompetitions() error {
 					{Path: "updatedAt", Value: now},
 				})
 
-				if err != nil {
-					log.Printf("❌ 대회 취소 처리 실패: %v", err)
-				} else {
+				if err == nil {
 					canceledCount++
-					log.Printf("✅ 대회 취소 완료: %s", competitionName)
 				}
 			}
 		}
 	}
 
-	log.Printf("✅ 미승인 대회 취소 체크 완료: %d개 대회 취소됨", canceledCount)
 	return nil
 }
 
-// finalizeCompetition - 대회 종료 처리 (내부 메서드)
-func (s *StatsService) finalizeCompetition(ctx context.Context, competitionID string, competitionName string) error {
+// FinalizeCompetition - 대회 종료 처리 (공개 메서드)
+func (s *StatsService) FinalizeCompetition(competitionID string) error {
+	ctx := context.Background()
 	now := time.Now()
+	
+	log.Printf("\n========================================")
+	log.Printf("🏆 대회 종료 처리 시작: %s", competitionID)
+	log.Printf("========================================\n")
 
 	// 1️⃣ Submissions 조회
-	log.Printf("📥 1/4: Submissions 조회 중...")
 	submissions, err := s.getCompetitionSubmissions(ctx, competitionID)
 	if err != nil {
+		log.Printf("❌ submissions 조회 실패: %v", err)
 		return fmt.Errorf("submissions 조회 실패: %v", err)
 	}
 
 	if len(submissions) == 0 {
-		log.Printf("ℹ️ 제출된 영상이 없습니다. 우승자 없이 종료 처리합니다.")
-
-		// 제출 없이 종료
+		log.Printf("⚠️ 제출된 영상이 없습니다. 대회를 FINISHED 상태로 변경합니다.")
 		_, err := s.firestore.Collection("competitions").Doc(competitionID).Update(ctx, []firestore.Update{
 			{Path: "status", Value: "FINISHED"},
 			{Path: "finishedAt", Value: now},
@@ -319,64 +283,170 @@ func (s *StatsService) finalizeCompetition(ctx context.Context, competitionID st
 		return err
 	}
 
-	log.Printf("📊 총 %d개 제출 영상", len(submissions))
-
 	// 2️⃣ YouTube 최종 조회수 수집
-	log.Printf("🎬 2/4: YouTube 최종 조회수 수집 중...")
 	if s.youtube != nil {
-		if err := s.updateYouTubeViewCounts(ctx, submissions); err != nil {
-			log.Printf("⚠️ YouTube 조회수 업데이트 실패 (기존 데이터 사용): %v", err)
-			// 실패해도 계속 진행
-		} else {
-			log.Printf("✅ YouTube 조회수 업데이트 완료")
-		}
-	} else {
-		log.Printf("⚠️ YouTube API 미설정 (기존 조회수 데이터 사용)")
+		s.updateYouTubeViewCounts(ctx, submissions)
 	}
 
-	// 3️⃣ 우승자 선정 (조회수 기준 정렬)
-	log.Printf("🏆 3/4: 우승자 선정 중...")
-	sort.Slice(submissions, func(i, j int) bool {
-		return submissions[i].CurrentViewCount > submissions[j].CurrentViewCount
+	// 3️⃣ 대회 정보 읽기 (상금 설정)
+	log.Printf("📊 대회 정보 조회 중...")
+	competitionDoc, err := s.firestore.Collection("competitions").Doc(competitionID).Get(ctx)
+	if err != nil {
+		log.Printf("❌ 대회 정보 조회 실패: %v", err)
+		return fmt.Errorf("대회 정보 조회 실패: %v", err)
+	}
+
+	competitionData := competitionDoc.Data()
+	totalPrize := getFloat64FromData(competitionData, "prize")
+	winnerCount := getIntFromData(competitionData, "winnerCount")
+	if winnerCount == 0 {
+		winnerCount = 3 // 기본값
+	}
+
+	// 개별 상금 금액 (Flutter에서 설정한 값)
+	prizeFirst := getFloat64FromData(competitionData, "prizeFirst")
+	prizeSecond := getFloat64FromData(competitionData, "prizeSecond")
+	prizeThird := getFloat64FromData(competitionData, "prizeThird")
+
+	// 기본값 설정 (개별 상금이 없으면 비율로 계산)
+	if prizeFirst == 0 && totalPrize > 0 {
+		prizeFirst = totalPrize * 0.5
+		prizeSecond = totalPrize * 0.3
+		prizeThird = totalPrize * 0.2
+	}
+	
+	log.Printf("✅ 대회 정보: 총 상금 %.0f원, 수상자 수 %d명", totalPrize, winnerCount)
+	log.Printf("  - 1등 상금: %.0f원", prizeFirst)
+	log.Printf("  - 2등 상금: %.0f원", prizeSecond)
+	log.Printf("  - 3등 상금: %.0f원", prizeThird)
+
+	// 4️⃣ submissions를 creatorId별로 그룹화하여 조회수 합산
+	creatorStats := make(map[string]*struct {
+		CreatorID   string
+		CreatorName string
+		TotalViews  int64
+		VideoCount  int
 	})
+
+	for _, sub := range submissions {
+		if sub.CurrentViewCount > 0 { // 조회수가 0보다 큰 영상만 집계
+			if _, exists := creatorStats[sub.CreatorID]; !exists {
+				creatorStats[sub.CreatorID] = &struct {
+					CreatorID   string
+					CreatorName string
+					TotalViews  int64
+					VideoCount  int
+				}{
+					CreatorID:   sub.CreatorID,
+					CreatorName: sub.CreatorName,
+					TotalViews:  0,
+					VideoCount:  0,
+				}
+			}
+			creatorStats[sub.CreatorID].TotalViews += sub.CurrentViewCount
+			creatorStats[sub.CreatorID].VideoCount++
+		}
+	}
+
+	log.Printf("📊 크리에이터별 통계:")
+	for creatorID, stats := range creatorStats {
+		log.Printf("  - %s (%s): %d개 영상, 총 조회수 %d", stats.CreatorName, creatorID, stats.VideoCount, stats.TotalViews)
+	}
+
+	// 유효한 참가자 필터링 (영상 1개 이상, 총 조회수 > 0)
+	type ValidCreator struct {
+		CreatorID   string
+		CreatorName string
+		TotalViews  int64
+	}
+
+	validCreators := []ValidCreator{}
+	for _, stats := range creatorStats {
+		if stats.VideoCount > 0 && stats.TotalViews > 0 {
+			validCreators = append(validCreators, ValidCreator{
+				CreatorID:   stats.CreatorID,
+				CreatorName: stats.CreatorName,
+				TotalViews:  stats.TotalViews,
+			})
+		}
+	}
+
+	if len(validCreators) == 0 {
+		log.Printf("⚠️ 유효한 참가자가 없습니다 (제출 영상: %d개)", len(submissions))
+	}
+
+	// 조회수 기준 정렬
+	sort.Slice(validCreators, func(i, j int) bool {
+		return validCreators[i].TotalViews > validCreators[j].TotalViews
+	})
+
+	log.Printf("📊 정렬된 순위:")
+	for i, creator := range validCreators {
+		log.Printf("  %d위: %s - 조회수 %d", i+1, creator.CreatorName, creator.TotalViews)
+	}
+
+	// 실제 수상자 수 결정
+	actualWinnerCount := winnerCount
+	if len(validCreators) < winnerCount {
+		actualWinnerCount = len(validCreators)
+		log.Printf("⚠️ 수상자 수 조정: %d명 → %d명 (유효 참가자 부족)", winnerCount, actualWinnerCount)
+	}
 
 	winners := make(map[string]interface{})
 
-	// 1등 (50%)
-	if len(submissions) > 0 {
+	// 5️⃣ 동적 수상자 선정
+	if actualWinnerCount >= 1 {
 		winners["first"] = WinnerInfo{
-			CreatorID:   submissions[0].CreatorID,
-			CreatorName: submissions[0].CreatorName,
-			ViewCount:   submissions[0].CurrentViewCount,
-			Prize:       0.5,
+			CreatorID:   validCreators[0].CreatorID,
+			CreatorName: validCreators[0].CreatorName,
+			ViewCount:   validCreators[0].TotalViews,
+			Prize:       prizeFirst,
 		}
-		log.Printf("🥇 1등: %s (%d views)", submissions[0].CreatorName, submissions[0].CurrentViewCount)
+		log.Printf("🥇 1등: %s - 조회수 %d, 상금 %.0f원", validCreators[0].CreatorName, validCreators[0].TotalViews, prizeFirst)
 	}
 
-	// 2등 (30%)
-	if len(submissions) > 1 {
+	if actualWinnerCount >= 2 {
 		winners["second"] = WinnerInfo{
-			CreatorID:   submissions[1].CreatorID,
-			CreatorName: submissions[1].CreatorName,
-			ViewCount:   submissions[1].CurrentViewCount,
-			Prize:       0.3,
+			CreatorID:   validCreators[1].CreatorID,
+			CreatorName: validCreators[1].CreatorName,
+			ViewCount:   validCreators[1].TotalViews,
+			Prize:       prizeSecond,
 		}
-		log.Printf("🥈 2등: %s (%d views)", submissions[1].CreatorName, submissions[1].CurrentViewCount)
+		log.Printf("🥈 2등: %s - 조회수 %d, 상금 %.0f원", validCreators[1].CreatorName, validCreators[1].TotalViews, prizeSecond)
 	}
 
-	// 3등 (20%)
-	if len(submissions) > 2 {
+	if actualWinnerCount >= 3 {
 		winners["third"] = WinnerInfo{
-			CreatorID:   submissions[2].CreatorID,
-			CreatorName: submissions[2].CreatorName,
-			ViewCount:   submissions[2].CurrentViewCount,
-			Prize:       0.2,
+			CreatorID:   validCreators[2].CreatorID,
+			CreatorName: validCreators[2].CreatorName,
+			ViewCount:   validCreators[2].TotalViews,
+			Prize:       prizeThird,
 		}
-		log.Printf("🥉 3등: %s (%d views)", submissions[2].CreatorName, submissions[2].CurrentViewCount)
+		log.Printf("🥉 3등: %s - 조회수 %d, 상금 %.0f원", validCreators[2].CreatorName, validCreators[2].TotalViews, prizeThird)
 	}
 
-	// 4️⃣ 최종 통계 계산 및 저장
-	log.Printf("📊 4/4: 최종 통계 계산 중...")
+	// 4등 이상 처리 (나머지 금액 균등 분배)
+	if actualWinnerCount > 3 {
+		remainderPrize := totalPrize - prizeFirst - prizeSecond - prizeThird
+		remainingWinners := actualWinnerCount - 3
+		prizePerPerson := 0.0
+		if remainingWinners > 0 {
+			prizePerPerson = remainderPrize / float64(remainingWinners)
+		}
+
+		for i := 3; i < actualWinnerCount; i++ {
+			rankKey := fmt.Sprintf("rank%d", i+1)
+			winners[rankKey] = WinnerInfo{
+				CreatorID:   validCreators[i].CreatorID,
+				CreatorName: validCreators[i].CreatorName,
+				ViewCount:   validCreators[i].TotalViews,
+				Prize:       prizePerPerson,
+			}
+			log.Printf("🏅 %d등: %s - 조회수 %d, 상금 %.0f원", i+1, validCreators[i].CreatorName, validCreators[i].TotalViews, prizePerPerson)
+		}
+	}
+
+	// 6️⃣ 최종 통계 계산 및 저장
 	totalViews := int64(0)
 	totalLikes := int64(0)
 	totalComments := int64(0)
@@ -403,46 +473,57 @@ func (s *StatsService) finalizeCompetition(ctx context.Context, competitionID st
 		"createdAt":        now,
 	}
 
-	_, err = s.firestore.Collection("competitions").
+	s.firestore.Collection("competitions").
 		Doc(competitionID).
 		Collection("analytics").
 		Doc("final").
 		Set(ctx, analyticsData)
 
+	// 7️⃣ 대회 문서 업데이트 (상태 + 우승자 + ⭐ 최종 통계)
+	log.Printf("\n💾 대회 정보 저장 중...")
+	log.Printf("  - status: FINISHED")
+	log.Printf("  - winners: %d명", len(winners))
+	log.Printf("  - finalDataCollected: true")
+	log.Printf("  - winnersUpdatedAt: %s", now.Format("2006-01-02 15:04:05"))
+	
+	// ⭐ 최종 참가자 수 조회
+	participantsCount, err := s.getParticipantsCount(ctx, competitionID)
 	if err != nil {
-		log.Printf("⚠️ Analytics 저장 실패: %v", err)
-		// 실패해도 계속 진행
+		log.Printf("⚠️ 참가자 수 조회 실패: %v (기본값 0 사용)", err)
+		participantsCount = 0
 	}
-
-	// 5️⃣ 대회 문서 업데이트 (상태 + 우승자)
+	
 	updateData := []firestore.Update{
 		{Path: "status", Value: "FINISHED"},
 		{Path: "finishedAt", Value: now},
 		{Path: "updatedAt", Value: now},
 		{Path: "winners", Value: winners},
+		{Path: "winnersUpdatedAt", Value: now},
 		{Path: "finalDataCollected", Value: true},
+		// ⭐ 최종 통계 (FINISHED 대회는 여기서 한 번만 저장)
+		{Path: "stats.participants", Value: participantsCount},
+		{Path: "stats.submissions", Value: len(submissions)},
 		{Path: "stats.totalViews", Value: totalViews},
-		{Path: "stats.totalSubmissions", Value: len(submissions)},
 		{Path: "stats.averageViews", Value: averageViews},
+		{Path: "stats.lastUpdated", Value: now},
 	}
 
 	_, err = s.firestore.Collection("competitions").Doc(competitionID).Update(ctx, updateData)
 	if err != nil {
-		return fmt.Errorf("대회 문서 업데이트 실패: %v", err)
+		log.Printf("❌ Firestore 업데이트 실패: %v", err)
+		return err
 	}
-
-	log.Printf("🎉 대회 종료 처리 완료!")
-	log.Printf("   - 총 조회수: %d", totalViews)
-	log.Printf("   - 평균 조회수: %.0f", averageViews)
-
+	
+	log.Printf("\n========================================")
+	log.Printf("✅ 대회 종료 처리 완료: %s", competitionID)
+	log.Printf("========================================\n")
+	
 	return nil
 }
 
 // RetryFailedFinalizations - 최종 데이터 미수집 대회 재처리 (오전 2시)
 func (s *StatsService) RetryFailedFinalizations() error {
 	ctx := context.Background()
-
-	log.Println("🔄 [오전 2시] 최종 데이터 미수집 대회 재처리 시작")
 
 	// finalDataCollected가 false인 FINISHED 대회 조회
 	iter := s.firestore.Collection("competitions").
@@ -469,18 +550,12 @@ func (s *StatsService) RetryFailedFinalizations() error {
 		competitionID := doc.Ref.ID
 		competitionName := getStringFromData(data, "title")
 
-		log.Printf("🔄 재처리 시작: %s (ID: %s)", competitionName, competitionID)
-
 		// 최종 데이터 수집만 다시 시도
-		if err := s.retryFinalDataCollection(ctx, competitionID, competitionName); err != nil {
-			log.Printf("❌ 재처리 실패: %s - %v", competitionName, err)
-		} else {
+		if err := s.retryFinalDataCollection(ctx, competitionID, competitionName); err == nil {
 			successCount++
-			log.Printf("✅ 재처리 성공: %s", competitionName)
 		}
 	}
 
-	log.Printf("✅ 재처리 완료: %d개 중 %d개 성공", retryCount, successCount)
 	return nil
 }
 
@@ -510,50 +585,58 @@ func (s *StatsService) retryFinalDataCollection(ctx context.Context, competition
 
 // ==================== 기존 통계 업데이트 메서드 (유지) ====================
 
-// 모든 활성 대회의 통계 업데이트
+// 모든 활성 대회의 통계 업데이트 (⭐ APPROVED, ONGOING만 - FINISHED는 종료 시 한 번만)
 func (s *StatsService) UpdateAllActiveCompetitions() error {
 	ctx := context.Background()
 
-	log.Println("🔄 활성 대회 통계 업데이트 시작")
+	// ⭐ APPROVED(참가자만), ONGOING만 조회 - FINISHED는 FinalizeCompetition()에서 한 번만 처리
+	statuses := []string{"APPROVED", "ONGOING"}
+	totalCount := 0
+	totalSuccess := 0
 
-	// ✅ ONGOING 상태 대회만 조회 (새로운 상태 체계)
-	iter := s.firestore.Collection("competitions").
-		Where("status", "==", "ONGOING").
-		Where("deleted", "==", false).
-		Documents(ctx)
+	for _, status := range statuses {
+		log.Printf("[%s] 대회 통계 업데이트 시작...", status)
+		
+		iter := s.firestore.Collection("competitions").
+			Where("status", "==", status).
+			Where("deleted", "==", false).
+			Documents(ctx)
 
-	count := 0
-	successCount := 0
-	for {
-		doc, err := iter.Next()
-		if err == iterator.Done {
-			break
+		count := 0
+		successCount := 0
+		for {
+			doc, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				log.Printf("❌ 대회 조회 오류: %v", err)
+				continue
+			}
+
+			count++
+			competitionID := doc.Ref.ID
+
+			// 각 대회 통계 업데이트
+			if err := s.UpdateCompetitionStats(competitionID); err == nil {
+				successCount++
+			} else {
+				log.Printf("⚠️ [%s] %s 통계 업데이트 실패: %v", status, competitionID, err)
+			}
 		}
-		if err != nil {
-			log.Printf("❌ 대회 조회 오류: %v", err)
-			continue
-		}
 
-		count++
-		competitionID := doc.Ref.ID
-
-		// 각 대회 통계 업데이트
-		if err := s.UpdateCompetitionStats(competitionID); err != nil {
-			log.Printf("❌ 대회 %s 통계 업데이트 실패: %v", competitionID, err)
-		} else {
-			successCount++
-		}
+		log.Printf("✅ [%s] %d/%d 대회 통계 업데이트 완료", status, successCount, count)
+		totalCount += count
+		totalSuccess += successCount
 	}
 
-	log.Printf("✅ 활성 대회 통계 업데이트 완료: %d개 중 %d개 성공", count, successCount)
+	log.Printf("🏆 전체 %d/%d 대회 통계 업데이트 완료", totalSuccess, totalCount)
 	return nil
 }
 
 // 특정 대회의 통계 업데이트
 func (s *StatsService) UpdateCompetitionStats(competitionID string) error {
 	ctx := context.Background()
-
-	log.Printf("📊 대회 %s 통계 업데이트 시작", competitionID)
 
 	// 1. 해당 대회의 모든 submissions 조회
 	submissions, err := s.getCompetitionSubmissions(ctx, competitionID)
@@ -562,7 +645,6 @@ func (s *StatsService) UpdateCompetitionStats(competitionID string) error {
 	}
 
 	if len(submissions) == 0 {
-		log.Printf("ℹ️ 대회 %s에 제출된 영상이 없습니다", competitionID)
 		return s.updateCompetitionStatsInFirestore(ctx, competitionID, CompetitionStats{
 			TotalSubmissions: 0,
 			TotalViews:       0,
@@ -573,30 +655,23 @@ func (s *StatsService) UpdateCompetitionStats(competitionID string) error {
 	}
 
 	// 2. YouTube 영상들의 조회수 업데이트
-	if err := s.updateYouTubeViewCounts(ctx, submissions); err != nil {
-		log.Printf("⚠️ YouTube 조회수 업데이트 실패: %v", err)
-		// YouTube 업데이트 실패해도 기존 데이터로 통계는 계산
-	}
+	s.updateYouTubeViewCounts(ctx, submissions)
 
 	// 3. 통계 계산
 	stats := s.calculateCompetitionStats(submissions)
 
 	// 4. Firebase에 통계 저장
-	if err := s.updateCompetitionStatsInFirestore(ctx, competitionID, stats); err != nil {
-		return fmt.Errorf("통계 저장 실패: %v", err)
-	}
-
-	log.Printf("✅ 대회 %s 통계 업데이트 완료 - 제출: %d, 조회수: %d, 크리에이터: %d",
-		competitionID, stats.TotalSubmissions, stats.TotalViews, stats.UniqueCreators)
-
-	return nil
+	return s.updateCompetitionStatsInFirestore(ctx, competitionID, stats)
 }
 
-// 대회의 모든 submissions 조회
+// 대회의 모든 submissions 조회 (삭제되지 않은 영상만)
 func (s *StatsService) getCompetitionSubmissions(ctx context.Context, competitionID string) ([]SubmissionData, error) {
+	log.Printf("📋 대회 submissions 조회 시작: %s", competitionID)
+	
 	iter := s.firestore.Collection("competitions").
 		Doc(competitionID).
 		Collection("submissions").
+		Where("isDeleted", "==", "n"). // ⭐ 삭제되지 않은 영상만
 		Documents(ctx)
 
 	var submissions []SubmissionData
@@ -606,10 +681,18 @@ func (s *StatsService) getCompetitionSubmissions(ctx context.Context, competitio
 			break
 		}
 		if err != nil {
+			log.Printf("❌ submissions 조회 오류: %v", err)
 			return nil, err
 		}
 
 		data := doc.Data()
+		
+		// ⭐ currentViewCount 또는 viewCount 중 큰 값 사용
+		viewCount := getInt64FromData(data, "currentViewCount")
+		if viewCount == 0 {
+			viewCount = getInt64FromData(data, "viewCount")
+		}
+		
 		submission := SubmissionData{
 			ID:               doc.Ref.ID,
 			CompetitionID:    competitionID,
@@ -617,7 +700,7 @@ func (s *StatsService) getCompetitionSubmissions(ctx context.Context, competitio
 			CreatorName:      getStringFromData(data, "creatorName"),
 			Platform:         getStringFromData(data, "platform"),
 			VideoID:          getStringFromData(data, "videoId"),
-			CurrentViewCount: getInt64FromData(data, "currentViewCount"),
+			CurrentViewCount: viewCount,
 		}
 
 		// YouTube 영상인 경우 youtubeData에서 videoId 추출
@@ -628,9 +711,13 @@ func (s *StatsService) getCompetitionSubmissions(ctx context.Context, competitio
 				}
 			}
 		}
+		
+		log.Printf("  - 영상 발견: %s (%s) - 조회수 %d", submission.CreatorName, submission.VideoID, submission.CurrentViewCount)
 
 		submissions = append(submissions, submission)
 	}
+	
+	log.Printf("✅ 총 %d개 submissions 조회 완료", len(submissions))
 
 	return submissions, nil
 }
@@ -656,8 +743,6 @@ func (s *StatsService) updateYouTubeViewCounts(ctx context.Context, submissions 
 		return nil
 	}
 
-	log.Printf("🎬 YouTube 영상 %d개 조회수 업데이트 중...", len(youtubeVideoIDs))
-
 	// YouTube API로 조회수 가져오기 (50개씩 배치 처리)
 	for i := 0; i < len(youtubeVideoIDs); i += 50 {
 		end := i + 50
@@ -666,9 +751,7 @@ func (s *StatsService) updateYouTubeViewCounts(ctx context.Context, submissions 
 		}
 
 		batch := youtubeVideoIDs[i:end]
-		if err := s.updateYouTubeViewCountsBatch(ctx, batch, youtubeSubmissions); err != nil {
-			log.Printf("⚠️ YouTube 배치 %d-%d 업데이트 실패: %v", i, end, err)
-		}
+		s.updateYouTubeViewCountsBatch(ctx, batch, youtubeSubmissions)
 	}
 
 	return nil
@@ -757,23 +840,31 @@ func (s *StatsService) calculateCompetitionStats(submissions []SubmissionData) C
 	}
 }
 
-// Firebase에 통계 저장
+// Firebase에 통계 저장 (⭐ 수정: 참가자, 영상수, 조회수 제대로 반영)
 func (s *StatsService) updateCompetitionStatsInFirestore(ctx context.Context, competitionID string, stats CompetitionStats) error {
 	docRef := s.firestore.Collection("competitions").Doc(competitionID)
 
+	// ⭐ participants 컬렉션에서 실제 참가자 수 조회
+	participantsCount, err := s.getParticipantsCount(ctx, competitionID)
+	if err != nil {
+		log.Printf("⚠️ 참가자 수 조회 실패: %v (기본값 0 사용)", err)
+		participantsCount = 0
+	}
+
 	updates := []firestore.Update{
 		{Path: "stats", Value: map[string]interface{}{
-			"totalSubmissions": stats.TotalSubmissions,
-			"totalViews":       stats.TotalViews,
+			"participants":     participantsCount,    // ⭐ 실제 참가자 수
+			"submissions":      stats.TotalSubmissions, // ⭐ 영상 수
+			"totalViews":       stats.TotalViews,       // ⭐ 조회수
 			"uniqueCreators":   stats.UniqueCreators,
 			"averageViews":     stats.AverageViews,
 			"lastUpdated":      stats.LastUpdated,
 		}},
-		{Path: "participantCount", Value: stats.TotalSubmissions},
-		{Path: "totalViews", Value: float64(stats.TotalViews)},
+		{Path: "participantCount", Value: participantsCount}, // 하위 호환성
+		{Path: "totalViews", Value: float64(stats.TotalViews)}, // 하위 호환성
 	}
 
-	_, err := docRef.Update(ctx, updates)
+	_, err = docRef.Update(ctx, updates)
 	return err
 }
 
@@ -781,8 +872,6 @@ func (s *StatsService) updateCompetitionStatsInFirestore(ctx context.Context, co
 func (s *StatsService) UpdateDailySystemStats() error {
 	ctx := context.Background()
 	today := time.Now().Format("2006-01-02")
-
-	log.Printf("📊 %s 시스템 통계 업데이트 시작", today)
 
 	// 전체 대회 수 계산
 	totalCompetitions, err := s.countDocuments(ctx, "competitions")
@@ -840,14 +929,7 @@ func (s *StatsService) UpdateDailySystemStats() error {
 	}
 
 	_, err = s.firestore.Collection("systemStats").Doc(today).Set(ctx, systemStats)
-	if err != nil {
-		return fmt.Errorf("시스템 통계 저장 실패: %v", err)
-	}
-
-	log.Printf("✅ %s 시스템 통계 업데이트 완료 - 대회: %d, 사용자: %d, 총 상금: %.0f",
-		today, totalCompetitions, totalUsers, totalPrizeAmount)
-
-	return nil
+	return err
 }
 
 // ==================== 유틸리티 메서드들 ====================
@@ -941,6 +1023,29 @@ func (s *StatsService) calculateTotalViews(ctx context.Context) (int64, error) {
 	return total, nil
 }
 
+// ⭐ 참가자 수 조회 (participants 컬렉션)
+func (s *StatsService) getParticipantsCount(ctx context.Context, competitionID string) (int, error) {
+	iter := s.firestore.Collection("competitions").
+		Doc(competitionID).
+		Collection("participants").
+		Where("status", "==", "accepted"). // status가 accepted인 참가자만
+		Documents(ctx)
+
+	count := 0
+	for {
+		_, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		count++
+	}
+
+	return count, nil
+}
+
 // 유틸리티 함수들
 func getStringFromData(data map[string]interface{}, key string) string {
 	if val, ok := data[key].(string); ok {
@@ -974,6 +1079,57 @@ func getIntFromData(data map[string]interface{}, key string) int {
 		}
 	}
 	return 0
+}
+
+func getFloat64FromData(data map[string]interface{}, key string) float64 {
+	if val, ok := data[key]; ok {
+		switch v := val.(type) {
+		case float64:
+			return v
+		case int:
+			return float64(v)
+		case int64:
+			return float64(v)
+		}
+	}
+	return 0
+}
+
+// CompletePrizePayment - ⭐ 상금 입금 완료 처리
+func (s *StatsService) CompletePrizePayment(competitionID, userID string) error {
+	ctx := context.Background()
+
+	// 1. 참가자 문서 경로
+	participantRef := s.firestore.Collection("competitions").Doc(competitionID).Collection("participants").Doc(userID)
+
+	// 2. 현재 상태 확인
+	participantDoc, err := participantRef.Get(ctx)
+	if err != nil {
+		return fmt.Errorf("참가자 정보 조회 실패: %v", err)
+	}
+
+	if !participantDoc.Exists() {
+		return fmt.Errorf("참가자를 찾을 수 없습니다")
+	}
+
+	data := participantDoc.Data()
+	prizeData, ok := data["prize"].(map[string]interface{})
+	if !ok || prizeData["prizeClaimStatus"] != "ready" {
+		return fmt.Errorf("상금 신청 상태가 아닙니다")
+	}
+
+	// 3. 입금 완료 처리
+	_, err = participantRef.Update(ctx, []firestore.Update{
+		{Path: "prize.prizeClaimStatus", Value: "completed"},
+		{Path: "prize.completedAt", Value: firestore.ServerTimestamp},
+	})
+
+	if err != nil {
+		return fmt.Errorf("입금 완료 처리 실패: %v", err)
+	}
+
+	log.Printf("✅ 입금 완료: Competition=%s, User=%s", competitionID, userID)
+	return nil
 }
 
 

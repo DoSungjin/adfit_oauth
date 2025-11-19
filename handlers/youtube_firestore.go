@@ -260,6 +260,50 @@ func (h *YouTubeHandlerFirestore) fetchChannelInfo(ctx context.Context, token *o
 	return channelInfo, nil
 }
 
+// GetVideoInfo retrieves video information by video ID (public endpoint - no auth required)
+func (h *YouTubeHandlerFirestore) GetVideoInfo(c *gin.Context) {
+	videoID := c.Param("videoId")
+	if videoID == "" {
+		videoID = c.Query("videoId")
+	}
+
+	if videoID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "videoId is required"})
+		return
+	}
+
+	// YouTube Data API v3를 사용하여 공개 정보 조회
+	apiKey := os.Getenv("YOUTUBE_API_KEY")
+	if apiKey == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "YOUTUBE_API_KEY not configured"})
+		return
+	}
+
+	ctx := context.Background()
+	youtubeService, err := youtube.NewService(ctx, option.WithAPIKey(apiKey))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create YouTube service"})
+		return
+	}
+
+	// 영상 정보 조회
+	videoResponse, err := youtubeService.Videos.List([]string{"snippet", "statistics", "contentDetails", "status"}).Id(videoID).Do()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get video info: " + err.Error()})
+		return
+	}
+
+	if len(videoResponse.Items) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Video not found"})
+		return
+	}
+
+	video := videoResponse.Items[0]
+	c.JSON(http.StatusOK, gin.H{
+		"items": []interface{}{video},
+	})
+}
+
 // GetChannelInfo retrieves channel information
 func (h *YouTubeHandlerFirestore) GetChannelInfo(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -567,153 +611,7 @@ func (h *YouTubeHandlerFirestore) GetUserInfo(c *gin.Context) {
 	})
 }
 
-// VerifyAndSaveAnalytics verifies video ownership and saves analytics
-func (h *YouTubeHandlerFirestore) VerifyAndSaveAnalytics(c *gin.Context) {
-	userID := c.GetString("user_id")
-	
-	// ⭐ 디버깅 로그 추가
-	fmt.Printf("[VerifyAndSave] 시작 - UserID: %s\n", userID)
-
-	var req struct {
-		VideoID       string `json:"videoId" binding:"required"`
-		CompetitionID string `json:"competitionId" binding:"required"`
-		SubmissionID  string `json:"submissionId" binding:"required"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fmt.Printf("[VerifyAndSave] JSON 바인딩 실패: %v\n", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	
-	fmt.Printf("[VerifyAndSave] Request - VideoID: %s, CompetitionID: %s, SubmissionID: %s\n", 
-		req.VideoID, req.CompetitionID, req.SubmissionID)
-
-	ctx := context.Background()
-
-	// Firestore에서 토큰 조회
-	doc, err := h.firestore.Collection("users").Doc(userID).
-		Collection("connections").Doc("youtube").Get(ctx)
-
-	if err != nil {
-		fmt.Printf("[VerifyAndSave] YouTube Token 조회 실패: %v\n", err)
-		c.JSON(http.StatusNotFound, gin.H{"error": "YouTube not connected"})
-		return
-	}
-	
-	fmt.Printf("[VerifyAndSave] YouTube Token 조회 성공\n")
-
-	var tokenData YouTubeToken
-	if err := doc.DataTo(&tokenData); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse token"})
-		return
-	}
-
-	// Token 복원
-	token := &oauth2.Token{
-		AccessToken:  tokenData.AccessToken,
-		RefreshToken: tokenData.RefreshToken,
-		Expiry:       tokenData.ExpiresAt,
-	}
-
-	if token.Expiry.Before(time.Now()) && tokenData.RefreshToken != "" {
-		newToken, err := h.oauth2Config.TokenSource(ctx, token).Token()
-		if err == nil {
-			token = newToken
-			h.firestore.Collection("users").Doc(userID).
-				Collection("connections").Doc("youtube").Update(ctx, []firestore.Update{
-				{Path: "accessToken", Value: newToken.AccessToken},
-				{Path: "expiresAt", Value: newToken.Expiry},
-				{Path: "updatedAt", Value: time.Now()},
-			})
-		}
-	}
-
-	// YouTube 서비스 생성
-	client := h.oauth2Config.Client(ctx, token)
-	youtubeService, err := youtube.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create YouTube service"})
-		return
-	}
-
-	// 채널 ID 조회
-	channelsResponse, err := youtubeService.Channels.List([]string{"id"}).Mine(true).Do()
-	if err != nil || len(channelsResponse.Items) == 0 {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get channel"})
-		return
-	}
-
-	channelID := channelsResponse.Items[0].Id
-
-	// 비디오 정보 조회
-	videosResponse, err := youtubeService.Videos.List([]string{"snippet", "statistics"}).
-		Id(req.VideoID).Do()
-
-	if err != nil || len(videosResponse.Items) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{
-			"error":   "Video not found",
-			"message": "video not found",
-		})
-		return
-	}
-
-	video := videosResponse.Items[0]
-
-	// 소유권 확인
-	if video.Snippet.ChannelId != channelID {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error":   "Ownership verification failed",
-			"message": "video is not owned by this channel",
-		})
-		return
-	}
-
-	fmt.Printf("Video ownership verified: %s (Channel: %s)\n", req.VideoID, channelID)
-
-	// Analytics 데이터 구성 (상세 정보 포함)
-	// ⭐ uint64 → int64 변환 (Firestore 호환)
-	analyticsData := map[string]interface{}{
-		"isVerified":    true,
-		"verifiedAt":    time.Now(),
-		"videoId":       req.VideoID,
-		"channelId":     channelID,
-		"channelName":   tokenData.ChannelName,
-		"title":         video.Snippet.Title,
-		"description":   video.Snippet.Description,
-		"publishedAt":   video.Snippet.PublishedAt,
-		"thumbnailUrl":  video.Snippet.Thumbnails.Default.Url,
-		"viewCount":     int64(video.Statistics.ViewCount),
-		"likeCount":     int64(video.Statistics.LikeCount),
-		"commentCount":  int64(video.Statistics.CommentCount),
-		"lastUpdated":   time.Now(),
-	}
-
-	// Firestore에 저장
-	submissionRef := h.firestore.Collection("competitions").Doc(req.CompetitionID).
-		Collection("submissions").Doc(req.SubmissionID)
-
-	_, err = submissionRef.Update(ctx, []firestore.Update{
-		{Path: "analytics", Value: analyticsData},
-	})
-
-	if err != nil {
-		fmt.Printf("Failed to save analytics: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":   "Failed to save analytics",
-			"message": "error:Failed to save analytics",
-		})
-		return
-	}
-
-	fmt.Printf("Analytics saved for video: %s\n", req.VideoID)
-
-	c.JSON(http.StatusOK, gin.H{
-		"success":   true,
-		"message":   "비디오 연동이 성공적으로 완료되었습니다",
-		"analytics": analyticsData,
-	})
-}
+// VerifyAndSaveAnalytics는 youtube_analytics.go에서 구현됨 (상세 Analytics 포함)
 
 // ExchangeToken exchanges authorization code for access token
 func (h *YouTubeHandlerFirestore) ExchangeToken(c *gin.Context) {

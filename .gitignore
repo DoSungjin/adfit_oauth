@@ -29,6 +29,12 @@ deploy_complete.bat
 deploy_no_port.bat
 deploy_production.ps1
 
+# ⭐ 배포 스크립트 (민감 정보 포함!)
+deploy.ps1
+deploy.sh
+update_env.ps1
+cloudbuild.yaml
+
 # 로그
 logs/
 *.log

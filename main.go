@@ -1,15 +1,21 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	"cloud.google.com/go/firestore"
+	firebase "firebase.google.com/go/v4"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/robfig/cron/v3"
+	"google.golang.org/api/option"
 	"gorm.io/gorm"
 
 	"adfit-oauth/config"
@@ -130,19 +136,19 @@ func initDB() (*gorm.DB, error) {
 func setupCORS(r *gin.Engine) {
 	// 기본 허용 origins
 	allowedOrigins := config.GetAllowedOrigins()
-	
+
 	// 동적 CORS 미들웨어 (localhost의 모든 포트 허용)
 	r.Use(func(c *gin.Context) {
 		origin := c.Request.Header.Get("Origin")
-		
+
 		// localhost로 시작하는 origin은 모두 허용 (개발 환경)
 		if strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:") {
 			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
 			c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 			c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization, Session-Token")
+			c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization, Session-Token, X-Admin-Token")
 			c.Writer.Header().Set("Access-Control-Max-Age", "86400")
-			
+
 			if c.Request.Method == "OPTIONS" {
 				c.AbortWithStatus(204)
 				return
@@ -150,16 +156,16 @@ func setupCORS(r *gin.Engine) {
 			c.Next()
 			return
 		}
-		
+
 		// 허용된 origins 체크
 		for _, allowedOrigin := range allowedOrigins {
 			if origin == allowedOrigin {
 				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
 				c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 				c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-				c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization, Session-Token")
+				c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization, Session-Token, X-Admin-Token")
 				c.Writer.Header().Set("Access-Control-Max-Age", "86400")
-				
+
 				if c.Request.Method == "OPTIONS" {
 					c.AbortWithStatus(204)
 					return
@@ -167,10 +173,10 @@ func setupCORS(r *gin.Engine) {
 				break
 			}
 		}
-		
+
 		c.Next()
 	})
-	
+
 	log.Printf("CORS configured with origins: %v (+ all localhost ports)", allowedOrigins)
 }
 
@@ -185,12 +191,28 @@ func setupHandlers(r *gin.Engine, db *gorm.DB) {
 	// Admin routes
 	setupAdminRoutes(r)
 
+	// Report routes
+	setupReportRoutes(r)
+
+	// CSV routes
+	setupCSVRoutes(r)
+
 	log.Println("All handlers configured")
 }
 
 // setupTikTokRoutes sets up TikTok OAuth routes
 func setupTikTokRoutes(r *gin.Engine, db *gorm.DB) {
-	tiktokHandler := &handlers.TikTokHandler{DB: db}
+	// Firestore 클라이언트 초기화
+	firestoreClient, err := initFirestoreClient()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize Firestore for TikTok: %v", err)
+		firestoreClient = nil
+	}
+
+	tiktokHandler := &handlers.TikTokHandler{
+		DB:        db,
+		Firestore: firestoreClient,
+	}
 
 	// Public routes
 	public := r.Group("/api/tiktok")
@@ -200,7 +222,7 @@ func setupTikTokRoutes(r *gin.Engine, db *gorm.DB) {
 		public.POST("/token", tiktokHandler.ExchangeToken)
 	}
 
-	// Protected routes
+	// Protected routes (JWT)
 	protected := r.Group("/api/tiktok")
 	protected.Use(middleware.AuthRequired())
 	{
@@ -208,6 +230,13 @@ func setupTikTokRoutes(r *gin.Engine, db *gorm.DB) {
 		protected.GET("/videos", tiktokHandler.GetVideos)
 		protected.POST("/refresh", tiktokHandler.RefreshToken)
 		protected.POST("/logout", tiktokHandler.Logout)
+	}
+
+	// Protected routes (Firebase Auth)
+	firestoreProtected := r.Group("/api/tiktok")
+	firestoreProtected.Use(middleware.FirebaseAuthRequired())
+	{
+		firestoreProtected.POST("/submit-video", tiktokHandler.SubmitVideo)
 	}
 
 	log.Println("TikTok routes configured")
@@ -227,6 +256,7 @@ func setupYouTubeRoutes(r *gin.Engine, db *gorm.DB) {
 		youtubePublic.GET("/auth", youtubeHandler.GetAuthURL)
 		youtubePublic.GET("/callback", youtubeHandler.HandleCallback)
 		youtubePublic.POST("/token", youtubeHandler.ExchangeToken)
+		youtubePublic.GET("/video/:videoId", youtubeHandler.GetVideoInfo) // 영상 정보 조회 (공개)
 	}
 
 	// Protected routes
@@ -259,9 +289,77 @@ func setupAdminRoutes(r *gin.Engine) {
 	{
 		// System health
 		adminGroup.GET("/system/health", adminHandler.GetSystemHealth)
+
+		// ⭐ 통계 즉시 업데이트 (수동 트리거)
+		adminGroup.POST("/stats/update-all", adminHandler.UpdateAllCompetitionStats)
+		adminGroup.POST("/stats/update/:competitionId", adminHandler.UpdateSingleCompetitionStats)
+
+		// 개별 대회 수상자 계산
+		adminGroup.POST("/competitions/:competitionId/calculate-winners", adminHandler.CalculateWinners)
+
+		// 대회 리포트 생성
+		adminGroup.POST("/competitions/:competitionId/generate-report", adminHandler.GenerateReport)
+
+		// ⭐ 상금 입금 완료 처리
+		adminGroup.POST("/competitions/:competitionId/prize/complete/:userId", adminHandler.CompletePrizePayment)
 	}
 
 	log.Println("Admin routes configured")
+}
+
+// setupCSVRoutes sets up CSV validation routes
+func setupCSVRoutes(r *gin.Engine) {
+	csvHandler, err := handlers.NewCSVHandler("posted-app-c4ff5.firebasestorage.app")
+	if err != nil {
+		log.Printf("Warning: Failed to initialize CSV handler: %v", err)
+		return
+	}
+
+	// Protected routes (Firebase Auth 필수)
+	csvProtected := r.Group("/api/csv")
+	csvProtected.Use(middleware.FirebaseAuthRequired())
+	{
+		csvProtected.POST("/validate-file1", csvHandler.ValidateAndSaveFile1)
+		csvProtected.POST("/validate-file2", csvHandler.ValidateAndSaveFile2)
+	}
+
+	log.Println("CSV routes configured")
+}
+
+// setupReportRoutes sets up report management routes
+func setupReportRoutes(r *gin.Engine) {
+	reportHandler, err := handlers.NewReportHandler()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize report handler: %v", err)
+		return
+	}
+
+	// Admin routes for report management
+	reportGroup := r.Group("/api/admin/reports")
+	reportGroup.Use(middleware.AdminAuthRequired())
+	{
+		// 전체 신고 목록 조회 (필터링 가능)
+		reportGroup.GET("", reportHandler.GetAllReports)
+
+		// 대회별 신고 조회
+		reportGroup.GET("/competition/:competitionId", reportHandler.GetReportsByCompetition)
+
+		// 신고 상태 업데이트
+		reportGroup.PUT("/:reportId", reportHandler.UpdateReportStatus)
+
+		// 신고 통계
+		reportGroup.GET("/stats", reportHandler.GetReportStats)
+	}
+
+	// Public route for creating reports (brand users)
+	reportPublic := r.Group("/api/reports")
+	reportPublic.Use(middleware.FirebaseAuthRequired())
+	{
+		// 신고 생성
+		reportPublic.POST("", reportHandler.CreateReport)
+	}
+
+	log.Println("Report routes configured")
 }
 
 // startTestCron starts the cron scheduler for competition status checks
@@ -274,18 +372,46 @@ func startTestCron() {
 		return
 	}
 
+	// ⭐ 서버 시작 시 한 번 실행 (5초 후)
+	go func() {
+		time.Sleep(5 * time.Second)
+		// log.Println("🚀 [서버 시작] 대회 상태 체크 및 통계 초기 업데이트...")
+
+		// 1. 대회 상태 체크 (APPROVED -> ONGOING, ONGOING -> FINISHED)
+		// log.Println("✅ 대회 상태 자동 전환 체크...")
+		runCompetitionStatusChecks(statsService)
+
+		// 2. 활성 대회 통계 업데이트
+		// log.Println("✅ 활성 대회 통계 업데이트...")
+		if err := statsService.UpdateAllActiveCompetitions(); err != nil {
+			// log.Printf("❌ 초기 통계 업데이트 실패: %v", err)
+		} else {
+			// log.Println("✅ 초기 통계 업데이트 완료")
+		}
+	}()
+
 	c := cron.New(cron.WithSeconds())
 
-	// 매일 자정에 실행
-	c.AddFunc("0 0 0 * * *", func() {
-		log.Println("Running daily competition status checks (00:00)")
+	// 매일 자정 5분에 실행 (대회 상태 체크)
+	c.AddFunc("0 5 0 * * *", func() {
+		// log.Println("Running daily competition status checks (00:05)")
 		runCompetitionStatusChecks(statsService)
 	})
 
 	// 매일 새벽 1시에도 실행 (백업)
 	c.AddFunc("0 0 1 * * *", func() {
-		log.Println("Running daily competition status checks (01:00)")
+		// log.Println("Running daily competition status checks (01:00)")
 		runCompetitionStatusChecks(statsService)
+	})
+
+	// ⭐ 매 시간마다 ONGOING/FINISHED 대회 통계 업데이트 (참가자, 영상수, 조회수)
+	c.AddFunc("0 0 * * * *", func() {
+		// log.Println("[Hourly] Updating active competitions stats...")
+		if err := statsService.UpdateAllActiveCompetitions(); err != nil {
+			// log.Printf("❌ Failed to update active competitions: %v", err)
+		} else {
+			// log.Println("✅ Active competitions stats updated successfully")
+		}
 	})
 
 	c.Start()
@@ -318,4 +444,39 @@ func runCompetitionStatusChecks(s *services.StatsService) {
 	}
 
 	log.Println("Competition status checks completed")
+}
+
+// initFirestoreClient initializes Firestore client
+func initFirestoreClient() (*firestore.Client, error) {
+	ctx := context.Background()
+
+	var app *firebase.App
+	var err error
+
+	if config.Config != nil {
+		if config.Config.Firebase.CredentialsPath != "" {
+			app, err = firebase.NewApp(ctx, &firebase.Config{
+				ProjectID: config.Config.Firebase.ProjectID,
+			}, option.WithCredentialsFile(config.Config.Firebase.CredentialsPath))
+		} else {
+			app, err = firebase.NewApp(ctx, &firebase.Config{
+				ProjectID: config.Config.Firebase.ProjectID,
+			})
+		}
+	} else {
+		app, err = firebase.NewApp(ctx, &firebase.Config{
+			ProjectID: "posted-app-c4ff5",
+		})
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("firebase 초기화 실패: %v", err)
+	}
+
+	firestoreClient, err := app.Firestore(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("firestore 초기화 실패: %v", err)
+	}
+
+	return firestoreClient, nil
 }

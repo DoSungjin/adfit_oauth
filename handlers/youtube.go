@@ -528,6 +528,50 @@ func (h *YouTubeHandler) RefreshToken(c *gin.Context) {
 	})
 }
 
+// GetVideoInfo retrieves video information by video ID (public endpoint - no auth required)
+func (h *YouTubeHandler) GetVideoInfo(c *gin.Context) {
+	videoID := c.Param("videoId")
+	if videoID == "" {
+		videoID = c.Query("videoId")
+	}
+
+	if videoID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "videoId is required"})
+		return
+	}
+
+	// YouTube Data API v3를 사용하여 공개 정보 조회
+	apiKey := os.Getenv("YOUTUBE_API_KEY")
+	if apiKey == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "YOUTUBE_API_KEY not configured"})
+		return
+	}
+
+	ctx := context.Background()
+	youtubeService, err := youtube.NewService(ctx, option.WithAPIKey(apiKey))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create YouTube service"})
+		return
+	}
+
+	// 영상 정보 조회
+	videoResponse, err := youtubeService.Videos.List([]string{"snippet", "statistics", "contentDetails", "status"}).Id(videoID).Do()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get video info: " + err.Error()})
+		return
+	}
+
+	if len(videoResponse.Items) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Video not found"})
+		return
+	}
+
+	video := videoResponse.Items[0]
+	c.JSON(http.StatusOK, gin.H{
+		"items": []interface{}{video},
+	})
+}
+
 // GetChannelInfo retrieves channel information
 func (h *YouTubeHandler) GetChannelInfo(c *gin.Context) {
 	userID := c.GetString("user_id")

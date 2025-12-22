@@ -19,6 +19,7 @@ import (
 	"gorm.io/gorm"
 
 	"adfit-oauth/models"
+	"adfit-oauth/services"
 )
 
 type TikTokHandler struct {
@@ -29,8 +30,20 @@ type TikTokHandler struct {
 // GetAuthURL generates TikTok OAuth authorization URL
 func (h *TikTokHandler) GetAuthURL(c *gin.Context) {
 	state := c.Query("state")
+	userID := c.Query("user_id") // ⭐ user_id 추가
+
+	// ⭐ state에 user_id 포함 (CSRF 방지 + user 식별)
 	if state == "" {
 		state = "default_state"
+	}
+
+	if userID != "" {
+		// state에 user_id를 포함시킴 (underscore로 구분)
+		// 예: randomState_userId
+		state = fmt.Sprintf("%s_%s", state, userID)
+		fmt.Printf("✅ State with user_id: %s\n", state)
+	} else {
+		fmt.Printf("⚠️ No user_id provided, using state only: %s\n", state)
 	}
 
 	// 환경변수에서 클라이언트 설정 가져오기
@@ -45,12 +58,13 @@ func (h *TikTokHandler) GetAuthURL(c *gin.Context) {
 	// 요청 스코프 설정
 	scopes := "user.info.basic,video.list"
 
-	// URL 구성
+	// ⭐ 계정 전환을 위한 파라미터 추가 (TikTok 공식 문서)
+	// disable_auto_auth=1: 항상 권한 승인 화면 표시 (자동 승인 스킵 안 함)
 	authURL := fmt.Sprintf(
-		"https://www.tiktok.com/v2/auth/authorize/?client_key=%s&redirect_uri=%s&scope=%s&state=%s&response_type=code",
+		"https://www.tiktok.com/v2/auth/authorize/?client_key=%s&response_type=code&scope=%s&redirect_uri=%s&state=%s&disable_auto_auth=1",
 		clientKey,
+		url.QueryEscape(scopes),
 		url.QueryEscape(redirectURI),
-		scopes,
 		url.QueryEscape(state),
 	)
 
@@ -58,6 +72,7 @@ func (h *TikTokHandler) GetAuthURL(c *gin.Context) {
 	fmt.Printf("🔵 Client Key: %s\n", clientKey)
 	fmt.Printf("🔵 Redirect URI: %s\n", redirectURI)
 	fmt.Printf("🔵 Scopes: %s\n", scopes)
+	fmt.Printf("🔵 State (with user_id): %s\n", state)
 	fmt.Printf("🔵 Redirecting to TikTok Auth URL: %s\n", authURL)
 
 	// TikTok OAuth 페이지로 리다이렉트
@@ -383,7 +398,7 @@ func (h *TikTokHandler) GetUserInfo(c *gin.Context) {
 	fmt.Printf("🔵 Token Scope: %s\n", userToken.Scope)
 
 	// TikTok API URL (User Info)
-	fields := "open_id,union_id,avatar_url,display_name"
+	fields := "open_id,union_id,display_name"
 
 	// API URL 구성
 	apiURL := fmt.Sprintf("https://open.tiktokapis.com/v2/user/info/?fields=%s", fields)
@@ -455,7 +470,6 @@ func (h *TikTokHandler) GetUserInfo(c *gin.Context) {
 			fmt.Println("\n🔵 ===== TikTok User Data =====")
 			fmt.Printf("  OpenID: %v\n", user["open_id"])
 			fmt.Printf("  DisplayName: %v\n", user["display_name"])
-			fmt.Printf("  AvatarURL: %v\n", user["avatar_url"])
 			fmt.Printf("  UnionID: %v\n", user["union_id"])
 			fmt.Println("================================\n")
 
@@ -471,7 +485,6 @@ func (h *TikTokHandler) GetUserInfo(c *gin.Context) {
 	basicUser := map[string]interface{}{
 		"open_id":      userToken.OpenID,
 		"display_name": "TikTok User",
-		"avatar_url":   "",
 		"union_id":     "",
 	}
 
@@ -637,34 +650,57 @@ func (h *TikTokHandler) RefreshToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// Logout deletes user's token
+// Logout deletes user's token AND revokes TikTok authorization (complete logout)
 func (h *TikTokHandler) Logout(c *gin.Context) {
 	userID := c.GetString("user_id")
 
-	// 토큰 삭제
+	fmt.Printf("🔵 Logout request - User ID: %s\n", userID)
+
+	// 1️⃣ DB에서 토큰 조회 (revoke 전에 필요)
+	var userToken models.UserToken
+	if err := h.DB.Where("user_id = ?", userID).First(&userToken).Error; err != nil {
+		fmt.Printf("⚠️ No token found for user: %s (already logged out)\n", userID)
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "Already logged out"})
+		return
+	}
+
+	// 2️⃣ TikTok Revoke API 호출 제거 (로컬 토큰만 삭제)
+	fmt.Printf("🔵 Skipping TikTok revoke API call (token will remain valid on TikTok side)\n")
+
+	// 3️⃣ SQLite에서 토큰 삭제
 	result := h.DB.Where("user_id = ?", userID).Delete(&models.UserToken{})
 	if result.Error != nil {
+		fmt.Printf("❌ Failed to delete token from SQLite: %v\n", result.Error)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to logout"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	fmt.Printf("✅ Token deleted from SQLite for user: %s\n", userID)
+	fmt.Printf("✅ Logout finished - User ID: %s\n", userID)
+	fmt.Printf("📝 ⭐ Local token deleted (TikTok authorization still valid)\n")
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Logged out successfully"})
 }
 
 // extractUserIDFromState extracts user ID from state parameter
+// state 형식: "randomState_userId" (GetAuthURL에서 생성)
 func extractUserIDFromState(state string) string {
 	// state가 비어있으면 빈 문자열 반환
 	if state == "" {
 		return ""
 	}
 
-	// 언더스코어로 구분된 경우 첫 부분만 추출
+	// 언더스코어로 구분: "randomState_userId"
 	parts := strings.Split(state, "_")
-	if len(parts) > 0 && parts[0] != "" {
-		return parts[0]
+
+	// ⭐ user_id는 마지막 부분 (underscore 이후)
+	if len(parts) >= 2 {
+		userID := parts[len(parts)-1]
+		fmt.Printf("✅ Extracted user_id: %s from state: %s\n", userID, state)
+		return userID
 	}
 
-	// 그대로 반환
+	// underscore가 없으면 state 자체가 userId일 수 있음
+	fmt.Printf("⚠️ No underscore in state, returning as-is: %s\n", state)
 	return state
 }
 
@@ -700,7 +736,7 @@ func (h *TikTokHandler) SubmitVideo(c *gin.Context) {
 	fmt.Printf("🎯 TikTok Video Submission - User: %s, Competition: %s, Video: %s\n",
 		userID, req.CompetitionID, req.VideoID)
 
-	// JWT 검증 (TikTok OpenID 추출)
+	// JWT 검증
 	token, err := jwt.Parse(req.JWT, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method")
@@ -713,17 +749,34 @@ func (h *TikTokHandler) SubmitVideo(c *gin.Context) {
 		return
 	}
 
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid JWT claims"})
+	// ⭐ SQLite에서 실제 TikTok 토큰 조회 (Cron에서 사용할 수 있도록)
+	var userToken models.UserToken
+	if err := h.DB.Where("user_id = ?", userID).First(&userToken).Error; err != nil {
+		fmt.Printf("❌ Token not found in SQLite for user: %s\n", userID)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "TikTok token not found. Please reconnect."})
 		return
 	}
 
-	openID, _ := claims["open_id"].(string)
+	fmt.Printf("✅ Found TikTok token for user %s (OpenID: %s)\n", userID, userToken.OpenID)
 
-	// Firestore에 저장할 데이터 준비
+	// ⭐ 멀티 DB 지원: 대회가 있는 DB 찾기
 	ctx := context.Background()
-	submissionRef := h.Firestore.Collection("competitions").Doc(req.CompetitionID).
+	clients := services.GetFirestoreClients()
+	competitionDB, isTestDB, err := clients.FindCompetitionDB(ctx, req.CompetitionID)
+	if err != nil {
+		fmt.Printf("❌ Competition not found in any DB: %s\n", req.CompetitionID)
+		c.JSON(http.StatusNotFound, gin.H{"error": "Competition not found"})
+		return
+	}
+
+	if isTestDB {
+		fmt.Printf("🧪 Using adtown-test DB for competition: %s\n", req.CompetitionID)
+	} else {
+		fmt.Printf("📦 Using default DB for competition: %s\n", req.CompetitionID)
+	}
+
+	// Firestore에 저장할 데이터 준비 (올바른 DB 사용)
+	submissionRef := competitionDB.Collection("competitions").Doc(req.CompetitionID).
 		Collection("submissions").NewDoc()
 
 	submissionData := map[string]interface{}{
@@ -737,15 +790,18 @@ func (h *TikTokHandler) SubmitVideo(c *gin.Context) {
 		"likeCount":     req.LikeCount,
 		"commentCount":  req.CommentCount,
 		"shareCount":    req.ShareCount,
-		"platform":      "tiktok",
+		"platform":      "tiktok",           // ⭐ 기존 필드 (호환성)
+		"platforms":     []string{"tiktok"}, // ⭐ 배열 필드 (Cron용)
 		"tiktokData": map[string]interface{}{
 			"videoId": req.VideoID,
 		},
-		// ⭐ Token 저장 (조회수 업데이트용)
+		// ⭐ 실제 TikTok 토큰 저장 (Cron이 API 호출할 수 있도록)
 		"tiktokAuth": map[string]interface{}{
-			"jwt":     req.JWT,
-			"openId":  openID,
-			"savedAt": time.Now().Format(time.RFC3339),
+			"accessToken":  userToken.AccessToken,
+			"refreshToken": userToken.RefreshToken,
+			"openId":       userToken.OpenID,
+			"expiresAt":    userToken.ExpiresAt.Format(time.RFC3339),
+			"savedAt":      time.Now().Format(time.RFC3339),
 		},
 		"submittedAt":  firestore.ServerTimestamp,
 		"isWinner":     false,
@@ -753,14 +809,14 @@ func (h *TikTokHandler) SubmitVideo(c *gin.Context) {
 		"isDeleted":    "n",
 	}
 
-	// Firestore Batch 작업
-	batch := h.Firestore.Batch()
+	// Firestore Batch 작업 (올바른 DB 사용)
+	batch := competitionDB.Batch()
 
 	// 1. submission 저장
 	batch.Set(submissionRef, submissionData)
 
 	// 2. participant 업데이트
-	participantRef := h.Firestore.Collection("competitions").Doc(req.CompetitionID).
+	participantRef := competitionDB.Collection("competitions").Doc(req.CompetitionID).
 		Collection("participants").Doc(userID)
 
 	batch.Update(participantRef, []firestore.Update{

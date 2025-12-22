@@ -21,6 +21,7 @@ database:
 firebase:
   project_id: "posted-app-c4ff5"
   credentials_path: ""  # 환경변수로 설정: GOOGLE_APPLICATION_CREDENTIALS
+  test_database_id: "adtown-test"  # 테스트용 Firestore DB
 
 # OAuth Providers
 oauth:
@@ -42,6 +43,14 @@ oauth:
       - "https://www.googleapis.com/auth/youtube.readonly"
       - "https://www.googleapis.com/auth/yt-analytics.readonly"
     api_key: ""         # 환경변수: YOUTUBE_API_KEY
+  
+  instagram:
+    app_id: ""          # 환경변수: INSTAGRAM_APP_ID
+    app_secret: ""      # 환경변수: INSTAGRAM_APP_SECRET
+    redirect_uri: "https://adfit-server-520676604613.asia-northeast3.run.app/api/instagram/callback"
+    scopes:
+      - "instagram_business_basic"
+      - "instagram_business_manage_insights"
 
 # CORS Configuration
 cors:
@@ -97,6 +106,7 @@ security:
 features:
   tiktok_enabled: true
   youtube_enabled: true
+  instagram_enabled: true
   stats_enabled: true
   cron_enabled: true
   analytics_enabled: false

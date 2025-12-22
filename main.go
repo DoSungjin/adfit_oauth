@@ -44,6 +44,11 @@ func main() {
 		log.Println("✅ Firebase Auth initialized")
 	}
 
+	// ⭐ Firestore Clients 초기화 (default + adtown-test)
+	if _, err := services.InitFirestoreClients(); err != nil {
+		log.Printf("Warning: FirestoreClients initialization failed: %v", err)
+	}
+
 	// Gin 모드 설정
 	if config.Config != nil && !config.IsDebugMode() {
 		gin.SetMode(gin.ReleaseMode)
@@ -75,8 +80,8 @@ func main() {
 		c.JSON(200, response)
 	})
 
-	// Cron 시작
-	go startTestCron()
+	// Cron 시작 - ⭐ setupHandlers에서 시작하도록 변경
+	// go startTestCron()  // setupHandlers 내부에서 호출
 
 	// 서버 시작
 	port := getPort()
@@ -188,6 +193,9 @@ func setupHandlers(r *gin.Engine, db *gorm.DB) {
 	// YouTube routes
 	setupYouTubeRoutes(r, db)
 
+	// Instagram routes
+	setupInstagramRoutes(r, db)
+
 	// Admin routes
 	setupAdminRoutes(r)
 
@@ -196,6 +204,17 @@ func setupHandlers(r *gin.Engine, db *gorm.DB) {
 
 	// CSV routes
 	setupCSVRoutes(r)
+
+	// TikTok Cron routes - ⭐ 싱글톤 초기화 후 공유
+	tiktokCronHandler, err := handlers.NewTikTokCronHandler()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize TikTok Cron handler: %v", err)
+		tiktokCronHandler = nil
+	}
+	setupTikTokCronRoutes(r, tiktokCronHandler)
+
+	// ⭐ Cron 스케줄러에 동일한 핸들러 전달
+	go startTestCron(tiktokCronHandler)
 
 	log.Println("All handlers configured")
 }
@@ -273,6 +292,55 @@ func setupYouTubeRoutes(r *gin.Engine, db *gorm.DB) {
 	}
 
 	log.Println("YouTube routes configured")
+}
+
+// setupInstagramRoutes sets up Instagram OAuth routes
+func setupInstagramRoutes(r *gin.Engine, db *gorm.DB) {
+	// Firestore 클라이언트 초기화
+	firestoreClient, err := initFirestoreClient()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize Firestore for Instagram: %v", err)
+		firestoreClient = nil
+	}
+
+	instagramHandler := &handlers.InstagramHandler{
+		DB:        db,
+		Firestore: firestoreClient,
+	}
+
+	// Public routes (인증 불필요)
+	public := r.Group("/api/instagram")
+	{
+		public.GET("/auth", instagramHandler.GetAuthURL)
+		public.GET("/callback", instagramHandler.HandleCallback)
+		// Facebook 정책 필수 엔드포인트
+		public.POST("/data-deletion", instagramHandler.DataDeletion)
+		public.POST("/deauthorize", instagramHandler.Deauthorize)
+		// 테스트용 엔드포인트 (PowerShell 테스트)
+		public.GET("/test/user", instagramHandler.TestGetUser)
+		public.GET("/test/media", instagramHandler.TestGetMedia)
+		public.GET("/test/insights/:mediaId", instagramHandler.TestGetInsights)
+	}
+
+	// Protected routes (JWT 인증)
+	protected := r.Group("/api/instagram")
+	protected.Use(middleware.AuthRequired())
+	{
+		protected.GET("/user", instagramHandler.GetUserInfoProtected)
+		protected.GET("/media", instagramHandler.GetMedia)
+		protected.GET("/insights/:mediaId", instagramHandler.GetMediaInsights)
+		protected.POST("/refresh", instagramHandler.RefreshLongLivedToken)
+		protected.POST("/logout", instagramHandler.Logout)
+	}
+
+	// Protected routes (Firebase Auth)
+	firebaseProtected := r.Group("/api/instagram")
+	firebaseProtected.Use(middleware.FirebaseAuthRequired())
+	{
+		firebaseProtected.POST("/submit-video", instagramHandler.SubmitVideo)
+	}
+
+	log.Println("Instagram routes configured")
 }
 
 // setupAdminRoutes sets up admin routes
@@ -363,7 +431,7 @@ func setupReportRoutes(r *gin.Engine) {
 }
 
 // startTestCron starts the cron scheduler for competition status checks
-func startTestCron() {
+func startTestCron(tiktokCronHandler *handlers.TikTokCronHandler) {
 	log.Println("Starting cron scheduler...")
 
 	statsService, err := services.NewStatsService()
@@ -372,21 +440,24 @@ func startTestCron() {
 		return
 	}
 
+	// ⭐ TikTok Cron Handler는 매개변수로 전달받음 (중복 초기화 방지)
+
 	// ⭐ 서버 시작 시 한 번 실행 (5초 후)
 	go func() {
 		time.Sleep(5 * time.Second)
-		// log.Println("🚀 [서버 시작] 대회 상태 체크 및 통계 초기 업데이트...")
 
 		// 1. 대회 상태 체크 (APPROVED -> ONGOING, ONGOING -> FINISHED)
-		// log.Println("✅ 대회 상태 자동 전환 체크...")
 		runCompetitionStatusChecks(statsService)
 
-		// 2. 활성 대회 통계 업데이트
-		// log.Println("✅ 활성 대회 통계 업데이트...")
+		// 2. 활성 대회 통계 업데이트 (YouTube)
 		if err := statsService.UpdateAllActiveCompetitions(); err != nil {
-			// log.Printf("❌ 초기 통계 업데이트 실패: %v", err)
-		} else {
-			// log.Println("✅ 초기 통계 업데이트 완료")
+			log.Printf("❌ YouTube 초기 통계 업데이트 실패: %v", err)
+		}
+
+		// 3. ⭐ TikTok 통계 업데이트 (서버 시작 시 1회)
+		if tiktokCronHandler != nil {
+			log.Println("🚀 [서버 시작] TikTok 통계 초기 업데이트...")
+			tiktokCronHandler.UpdateTikTokStatsInternal()
 		}
 	}()
 
@@ -406,11 +477,15 @@ func startTestCron() {
 
 	// ⭐ 매 시간마다 ONGOING/FINISHED 대회 통계 업데이트 (참가자, 영상수, 조회수)
 	c.AddFunc("0 0 * * * *", func() {
-		// log.Println("[Hourly] Updating active competitions stats...")
+		// YouTube 통계 업데이트
 		if err := statsService.UpdateAllActiveCompetitions(); err != nil {
-			// log.Printf("❌ Failed to update active competitions: %v", err)
-		} else {
-			// log.Println("✅ Active competitions stats updated successfully")
+			log.Printf("❌ [Hourly] YouTube 통계 업데이트 실패: %v", err)
+		}
+
+		// ⭐ TikTok 통계 업데이트
+		if tiktokCronHandler != nil {
+			log.Println("🔄 [Hourly] TikTok 통계 업데이트...")
+			tiktokCronHandler.UpdateTikTokStatsInternal()
 		}
 	})
 
@@ -479,4 +554,51 @@ func initFirestoreClient() (*firestore.Client, error) {
 	}
 
 	return firestoreClient, nil
+}
+
+// setupTikTokCronRoutes sets up TikTok Cron routes
+func setupTikTokCronRoutes(r *gin.Engine, tiktokCronHandler *handlers.TikTokCronHandler) {
+	if tiktokCronHandler == nil {
+		log.Println("Warning: TikTok Cron handler is nil, skipping routes")
+		return
+	}
+
+	// Cron 라우트 (보안 토큰 필요)
+	cronGroup := r.Group("/api/cron/tiktok")
+	cronGroup.Use(func(c *gin.Context) {
+		token := c.GetHeader("X-Cron-Token")
+		if token == "" {
+			token = c.GetHeader("Authorization")
+			if token != "" && len(token) > 7 && token[:7] == "Bearer " {
+				token = token[7:]
+			}
+		}
+		
+		// 환경변수에서 CRON_SECRET_TOKEN 확인
+		expectedToken := os.Getenv("CRON_SECRET_TOKEN")
+		if expectedToken == "" {
+			expectedToken = "adfit-cron-secret-2025" // 기본값
+		}
+		
+		if token != expectedToken {
+			c.AbortWithStatusJSON(401, gin.H{"error": "Unauthorized"})
+			return
+		}
+		c.Next()
+	})
+	{
+		// 매시간 실행: TikTok 영상 통계 업데이트 (전체)
+		cronGroup.POST("/update-stats", tiktokCronHandler.UpdateTikTokStats)
+		
+		// ⭐ 단일 대회 업데이트
+		cronGroup.POST("/update-stats/:competitionId", tiktokCronHandler.UpdateSingleCompetitionStats)
+		
+		// ⭐ 단일 영상 업데이트
+		cronGroup.POST("/update-submission/:competitionId/:submissionId", tiktokCronHandler.UpdateSingleSubmissionStats)
+		
+		// 매일 실행: 만료된 토큰 정리
+		cronGroup.POST("/cleanup-tokens", tiktokCronHandler.CleanupExpiredTokens)
+	}
+
+	log.Println("TikTok Cron routes configured")
 }

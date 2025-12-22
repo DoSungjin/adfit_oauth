@@ -23,7 +23,6 @@ type TikTokUser struct {
     OpenID      string `json:"open_id"`
     UnionID     string `json:"union_id"`
     DisplayName string `json:"display_name"`
-    AvatarURL   string `json:"avatar_url"`
 }
 
 type TikTokVideo struct {

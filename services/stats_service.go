@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"time"
 
 	"cloud.google.com/go/firestore"
-	firebase "firebase.google.com/go/v4"
+	"firebase.google.com/go/v4/db"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/api/youtube/v3"
@@ -17,8 +18,11 @@ import (
 )
 
 type StatsService struct {
-	firestore *firestore.Client
-	youtube   *youtube.Service
+	firestore  *firestore.Client
+	testDB     *firestore.Client  // adtown-test
+	realtimeDB *db.Client
+	youtube    *youtube.Service
+	clients    *FirestoreClients  // ⭐ 두 DB 관리자
 }
 
 type CompetitionStats struct {
@@ -47,52 +51,29 @@ type WinnerInfo struct {
 }
 
 func NewStatsService() (*StatsService, error) {
-	ctx := context.Background()
-
-	// Firebase 초기화
-	var app *firebase.App
-	var err error
-
-	// config가 로드되어 있으면 사용, 없으면 기본값
-	if config.Config != nil {
-		if config.Config.Firebase.CredentialsPath != "" {
-			app, err = firebase.NewApp(ctx, &firebase.Config{
-				ProjectID: config.Config.Firebase.ProjectID,
-			}, option.WithCredentialsFile(config.Config.Firebase.CredentialsPath))
-		} else {
-			app, err = firebase.NewApp(ctx, &firebase.Config{
-				ProjectID: config.Config.Firebase.ProjectID,
-			})
-		}
-	} else {
-		// 기존 방식 (하위 호환성)
-		app, err = firebase.NewApp(ctx, &firebase.Config{
-			ProjectID: "posted-app-c4ff5",
-		})
+	// ⭐ FirestoreClients 사용 (두 DB 동시 지원)
+	clients := GetFirestoreClients()
+	if clients == nil {
+		return nil, fmt.Errorf("FirestoreClients 초기화 실패")
 	}
 
-	if err != nil {
-		return nil, fmt.Errorf("firebase 초기화 실패: %v", err)
-	}
-
-	// Firestore 클라이언트
-	firestoreClient, err := app.Firestore(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("firestore 클라이언트 생성 실패: %v", err)
-	}
+	firestoreClient := clients.GetDefaultDB()
+	testClient := clients.GetTestDB()
+	realtimeDBClient := clients.GetRealtimeDB()
 
 	// YouTube 서비스 초기화
+	ctx := context.Background()
 	var youtubeService *youtube.Service
 	var apiKey string
 
-	if config.Config != nil {
+	// ⭐ 환경변수 우선, Config는 fallback
+	apiKey = os.Getenv("YOUTUBE_API_KEY")
+	if apiKey == "" && config.Config != nil {
 		apiKey = config.GetYouTubeAPIKey()
-	} else {
-		// 환경변수에서 직접 읽기 (하위 호환성)
-		apiKey = "YOUR_YOUTUBE_API_KEY" // 실제 키로 교체 필요
 	}
 
 	if apiKey != "" && apiKey != "YOUR_YOUTUBE_API_KEY" {
+		var err error
 		youtubeService, err = youtube.NewService(ctx, option.WithAPIKey(apiKey))
 		if err != nil {
 			log.Printf("⚠️ YouTube 서비스 초기화 실패: %v", err)
@@ -106,8 +87,11 @@ func NewStatsService() (*StatsService, error) {
 	}
 
 	return &StatsService{
-		firestore: firestoreClient,
-		youtube:   youtubeService,
+		firestore:  firestoreClient,
+		testDB:     testClient,
+		realtimeDB: realtimeDBClient,
+		youtube:    youtubeService,
+		clients:    clients,
 	}, nil
 }
 
@@ -118,42 +102,49 @@ func (s *StatsService) CheckAndStartApprovedCompetitions() error {
 	ctx := context.Background()
 	now := time.Now()
 
-	// APPROVED 상태 대회 조회
-	iter := s.firestore.Collection("competitions").
-		Where("status", "==", "APPROVED").
-		Where("deleted", "==", false).
-		Documents(ctx)
+	// ⭐ 두 DB 모두에서 조회
+	databases := []*firestore.Client{s.firestore}
+	if s.testDB != nil {
+		databases = append(databases, s.testDB)
+	}
 
 	startedCount := 0
-	for {
-		doc, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			log.Printf("❌ APPROVED 대회 조회 오류: %v", err)
-			continue
-		}
+	for _, db := range databases {
+		iter := db.Collection("competitions").
+			Where("status", "==", "APPROVED").
+			Where("deleted", "==", false).
+			Documents(ctx)
 
-		data := doc.Data()
+		for {
+			doc, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				log.Printf("❌ APPROVED 대회 조회 오류: %v", err)
+				continue
+			}
 
-		// startDate 확인
-		startDate, ok := data["startDate"].(time.Time)
-		if !ok {
-			continue
-		}
+			data := doc.Data()
 
-		// startDate가 현재 시간보다 이전이거나 같으면 시작
-		if startDate.Before(now) || startDate.Equal(now) {
-			// ONGOING으로 상태 변경
-			_, err := doc.Ref.Update(ctx, []firestore.Update{
-				{Path: "status", Value: "ONGOING"},
-				{Path: "startedAt", Value: now},
-				{Path: "updatedAt", Value: now},
-			})
+			// startDate 확인
+			startDate, ok := data["startDate"].(time.Time)
+			if !ok {
+				continue
+			}
 
-			if err == nil {
-				startedCount++
+			// startDate가 현재 시간보다 이전이거나 같으면 시작
+			if startDate.Before(now) || startDate.Equal(now) {
+				// ONGOING으로 상태 변경
+				_, err := doc.Ref.Update(ctx, []firestore.Update{
+					{Path: "status", Value: "ONGOING"},
+					{Path: "startedAt", Value: now},
+					{Path: "updatedAt", Value: now},
+				})
+
+				if err == nil {
+					startedCount++
+				}
 			}
 		}
 	}
@@ -166,37 +157,44 @@ func (s *StatsService) CheckAndFinishOngoingCompetitions() error {
 	ctx := context.Background()
 	now := time.Now()
 
-	// ONGOING 상태 대회 조회
-	iter := s.firestore.Collection("competitions").
-		Where("status", "==", "ONGOING").
-		Where("deleted", "==", false).
-		Documents(ctx)
+	// ⭐ 두 DB 모두에서 조회
+	databases := []*firestore.Client{s.firestore}
+	if s.testDB != nil {
+		databases = append(databases, s.testDB)
+	}
 
 	finishedCount := 0
-	for {
-		doc, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			log.Printf("❌ ONGOING 대회 조회 오류: %v", err)
-			continue
-		}
+	for _, db := range databases {
+		iter := db.Collection("competitions").
+			Where("status", "==", "ONGOING").
+			Where("deleted", "==", false).
+			Documents(ctx)
 
-		data := doc.Data()
-		competitionID := doc.Ref.ID
+		for {
+			doc, err := iter.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				log.Printf("❌ ONGOING 대회 조회 오류: %v", err)
+				continue
+			}
 
-		// deadline 확인
-		deadline, ok := data["deadline"].(time.Time)
-		if !ok {
-			continue
-		}
+			data := doc.Data()
+			competitionID := doc.Ref.ID
 
-		// deadline이 지났으면 종료 처리
-		if deadline.Before(now) {
-			// 종료 처리 (YouTube 데이터 수집 + 우승자 선정)
-			if err := s.FinalizeCompetition(competitionID); err == nil {
-				finishedCount++
+			// deadline 확인
+			deadline, ok := data["deadline"].(time.Time)
+			if !ok {
+				continue
+			}
+
+			// deadline이 지났으면 종료 처리
+			if deadline.Before(now) {
+				// 종료 처리 (YouTube 데이터 수집 + 우승자 선정)
+				if err := s.FinalizeCompetitionWithDB(competitionID, db); err == nil {
+					finishedCount++
+				}
 			}
 		}
 	}
@@ -208,46 +206,53 @@ func (s *StatsService) CheckAndCancelPendingCompetitions() error {
 	ctx := context.Background()
 	now := time.Now()
 
-	// REGISTERED, NOTICED, UNDERREVIEW 상태 대회 조회
+	// ⭐ 두 DB 모두에서 조회
+	databases := []*firestore.Client{s.firestore}
+	if s.testDB != nil {
+		databases = append(databases, s.testDB)
+	}
+
 	pendingStatuses := []string{"REGISTERED", "NOTICED", "UNDERREVIEW"}
 	canceledCount := 0
 
-	for _, status := range pendingStatuses {
-		iter := s.firestore.Collection("competitions").
-			Where("status", "==", status).
-			Where("deleted", "==", false).
-			Documents(ctx)
+	for _, db := range databases {
+		for _, status := range pendingStatuses {
+			iter := db.Collection("competitions").
+				Where("status", "==", status).
+				Where("deleted", "==", false).
+				Documents(ctx)
 
-		for {
-			doc, err := iter.Next()
-			if err == iterator.Done {
-				break
-			}
-			if err != nil {
-				log.Printf("❌ %s 대회 조회 오류: %v", status, err)
-				continue
-			}
+			for {
+				doc, err := iter.Next()
+				if err == iterator.Done {
+					break
+				}
+				if err != nil {
+					log.Printf("❌ %s 대회 조회 오류: %v", status, err)
+					continue
+				}
 
-			data := doc.Data()
+				data := doc.Data()
 
-			// startDate 확인
-			startDate, ok := data["startDate"].(time.Time)
-			if !ok {
-				continue
-			}
+				// startDate 확인
+				startDate, ok := data["startDate"].(time.Time)
+				if !ok {
+					continue
+				}
 
-			// 개최일이 되었는데도 승인 안 되면 취소
-			if startDate.Before(now) || startDate.Equal(now) {
-				// CANCELLED로 상태 변경
-				_, err := doc.Ref.Update(ctx, []firestore.Update{
-					{Path: "status", Value: "CANCELLED"},
-					{Path: "cancelledAt", Value: now},
-					{Path: "cancelReason", Value: "자동 취소: 승인 미완료"},
-					{Path: "updatedAt", Value: now},
-				})
+				// 개최일이 되었는데도 승인 안 되면 취소
+				if startDate.Before(now) || startDate.Equal(now) {
+					// CANCELLED로 상태 변경
+					_, err := doc.Ref.Update(ctx, []firestore.Update{
+						{Path: "status", Value: "CANCELLED"},
+						{Path: "cancelledAt", Value: now},
+						{Path: "cancelReason", Value: "자동 취소: 승인 미완료"},
+						{Path: "updatedAt", Value: now},
+					})
 
-				if err == nil {
-					canceledCount++
+					if err == nil {
+						canceledCount++
+					}
 				}
 			}
 		}
@@ -256,8 +261,13 @@ func (s *StatsService) CheckAndCancelPendingCompetitions() error {
 	return nil
 }
 
-// FinalizeCompetition - 대회 종료 처리 (공개 메서드)
+// FinalizeCompetition - 대회 종료 처리 (공개 메서드 - default DB 사용)
 func (s *StatsService) FinalizeCompetition(competitionID string) error {
+	return s.FinalizeCompetitionWithDB(competitionID, s.firestore)
+}
+
+// FinalizeCompetitionWithDB - 대회 종료 처리 (특정 DB 사용)
+func (s *StatsService) FinalizeCompetitionWithDB(competitionID string, db *firestore.Client) error {
 	ctx := context.Background()
 	now := time.Now()
 	
@@ -266,7 +276,7 @@ func (s *StatsService) FinalizeCompetition(competitionID string) error {
 	log.Printf("========================================\n")
 
 	// 1️⃣ Submissions 조회
-	submissions, err := s.getCompetitionSubmissions(ctx, competitionID)
+	submissions, err := s.getCompetitionSubmissionsWithDB(ctx, competitionID, db)
 	if err != nil {
 		log.Printf("❌ submissions 조회 실패: %v", err)
 		return fmt.Errorf("submissions 조회 실패: %v", err)
@@ -274,7 +284,7 @@ func (s *StatsService) FinalizeCompetition(competitionID string) error {
 
 	if len(submissions) == 0 {
 		log.Printf("⚠️ 제출된 영상이 없습니다. 대회를 FINISHED 상태로 변경합니다.")
-		_, err := s.firestore.Collection("competitions").Doc(competitionID).Update(ctx, []firestore.Update{
+		_, err := db.Collection("competitions").Doc(competitionID).Update(ctx, []firestore.Update{
 			{Path: "status", Value: "FINISHED"},
 			{Path: "finishedAt", Value: now},
 			{Path: "updatedAt", Value: now},
@@ -290,7 +300,7 @@ func (s *StatsService) FinalizeCompetition(competitionID string) error {
 
 	// 3️⃣ 대회 정보 읽기 (상금 설정)
 	log.Printf("📊 대회 정보 조회 중...")
-	competitionDoc, err := s.firestore.Collection("competitions").Doc(competitionID).Get(ctx)
+	competitionDoc, err := db.Collection("competitions").Doc(competitionID).Get(ctx)
 	if err != nil {
 		log.Printf("❌ 대회 정보 조회 실패: %v", err)
 		return fmt.Errorf("대회 정보 조회 실패: %v", err)
@@ -473,7 +483,7 @@ func (s *StatsService) FinalizeCompetition(competitionID string) error {
 		"createdAt":        now,
 	}
 
-	s.firestore.Collection("competitions").
+	db.Collection("competitions").
 		Doc(competitionID).
 		Collection("analytics").
 		Doc("final").
@@ -487,7 +497,7 @@ func (s *StatsService) FinalizeCompetition(competitionID string) error {
 	log.Printf("  - winnersUpdatedAt: %s", now.Format("2006-01-02 15:04:05"))
 	
 	// ⭐ 최종 참가자 수 조회
-	participantsCount, err := s.getParticipantsCount(ctx, competitionID)
+	participantsCount, err := s.getParticipantsCountWithDB(ctx, competitionID, db)
 	if err != nil {
 		log.Printf("⚠️ 참가자 수 조회 실패: %v (기본값 0 사용)", err)
 		participantsCount = 0
@@ -508,7 +518,7 @@ func (s *StatsService) FinalizeCompetition(competitionID string) error {
 		{Path: "stats.lastUpdated", Value: now},
 	}
 
-	_, err = s.firestore.Collection("competitions").Doc(competitionID).Update(ctx, updateData)
+	_, err = db.Collection("competitions").Doc(competitionID).Update(ctx, updateData)
 	if err != nil {
 		log.Printf("❌ Firestore 업데이트 실패: %v", err)
 		return err
@@ -693,23 +703,35 @@ func (s *StatsService) getCompetitionSubmissions(ctx context.Context, competitio
 			viewCount = getInt64FromData(data, "viewCount")
 		}
 		
+		// ⭐ platform 판단 (youtubeData 있으면 youtube)
+		platform := getStringFromData(data, "platform")
+		if platform == "" {
+			if _, hasYouTubeData := data["youtubeData"]; hasYouTubeData {
+				platform = "youtube"
+			}
+		}
+		
+		// ⭐ videoId 추출 (여러 위치 체크)
+		videoID := getStringFromData(data, "videoId")
+		if videoID == "" && platform == "youtube" {
+			if youtubeData, ok := data["youtubeData"].(map[string]interface{}); ok {
+				// videoId 또는 id 체크
+				if vid, ok := youtubeData["videoId"].(string); ok {
+					videoID = vid
+				} else if vid, ok := youtubeData["id"].(string); ok {
+					videoID = vid
+				}
+			}
+		}
+		
 		submission := SubmissionData{
 			ID:               doc.Ref.ID,
 			CompetitionID:    competitionID,
 			CreatorID:        getStringFromData(data, "creatorId"),
 			CreatorName:      getStringFromData(data, "creatorName"),
-			Platform:         getStringFromData(data, "platform"),
-			VideoID:          getStringFromData(data, "videoId"),
+			Platform:         platform,
+			VideoID:          videoID,
 			CurrentViewCount: viewCount,
-		}
-
-		// YouTube 영상인 경우 youtubeData에서 videoId 추출
-		if submission.Platform == "youtube" {
-			if youtubeData, ok := data["youtubeData"].(map[string]interface{}); ok {
-				if videoID, ok := youtubeData["videoId"].(string); ok {
-					submission.VideoID = videoID
-				}
-			}
 		}
 		
 		log.Printf("  - 영상 발견: %s (%s) - 조회수 %d", submission.CreatorName, submission.VideoID, submission.CurrentViewCount)
@@ -767,10 +789,15 @@ func (s *StatsService) updateYouTubeViewCountsBatch(ctx context.Context, videoID
 
 	// 배치 쓰기 준비
 	batch := s.firestore.Batch()
+	
+	// ⭐ Realtime DB 업데이트를 위한 크리에이터 추적
+	affectedCreators := make(map[string]map[string]bool) // competitionID -> creatorID set
 
 	for _, video := range response.Items {
 		if submission, exists := submissions[video.Id]; exists {
 			viewCount := int64(video.Statistics.ViewCount)
+			likeCount := int64(video.Statistics.LikeCount)
+			commentCount := int64(video.Statistics.CommentCount)
 
 			// submissions 문서 업데이트
 			docRef := s.firestore.Collection("competitions").
@@ -791,27 +818,66 @@ func (s *StatsService) updateYouTubeViewCountsBatch(ctx context.Context, videoID
 				})
 
 				// 좋아요, 댓글 수도 업데이트
-				if video.Statistics.LikeCount > 0 {
+				if likeCount > 0 {
 					updates = append(updates, firestore.Update{
 						Path:  "youtubeData.statistics.likeCount",
-						Value: video.Statistics.LikeCount,
+						Value: likeCount,
 					})
 				}
-				if video.Statistics.CommentCount > 0 {
+				if commentCount > 0 {
 					updates = append(updates, firestore.Update{
 						Path:  "youtubeData.statistics.commentCount",
-						Value: video.Statistics.CommentCount,
+						Value: commentCount,
 					})
 				}
 			}
 
 			batch.Update(docRef, updates)
+			
+			// ⭐ Realtime DB에도 업데이트
+			if s.realtimeDB != nil {
+				realtimeData := map[string]interface{}{
+					"creatorId":    submission.CreatorID,
+					"creatorName":  submission.CreatorName,
+					"platform":     submission.Platform,
+					"videoId":      submission.VideoID,
+					"viewCount":    viewCount,
+					"likeCount":    likeCount,
+					"commentCount": commentCount,
+					"lastUpdated":  time.Now().Unix(),
+				}
+				
+				if err := s.updateRealtimeSubmission(ctx, submission.CompetitionID, submission.ID, realtimeData); err != nil {
+					log.Printf("⚠️ Realtime DB submission 업데이트 실패 [%s]: %v", submission.ID, err)
+				}
+				
+				// 영향받은 크리에이터 추적
+				if affectedCreators[submission.CompetitionID] == nil {
+					affectedCreators[submission.CompetitionID] = make(map[string]bool)
+				}
+				affectedCreators[submission.CompetitionID][submission.CreatorID] = true
+			}
 		}
 	}
 
-	// 배치 실행
+	// 배치 실행 (Firestore)
 	_, err = batch.Commit(ctx)
-	return err
+	if err != nil {
+		return err
+	}
+	
+	// ⭐ 영향받은 크리에이터들의 Realtime DB 리더보드 업데이트
+	if s.realtimeDB != nil {
+		for competitionID, creators := range affectedCreators {
+			for creatorID := range creators {
+				if err := s.updateRealtimeLeaderboard(ctx, competitionID, creatorID); err != nil {
+					log.Printf("⚠️ Realtime DB leaderboard 업데이트 실패 [%s/%s]: %v", competitionID, creatorID, err)
+				}
+			}
+		}
+	}
+	
+	return nil
 }
 
 // 통계 계산
@@ -1130,6 +1196,220 @@ func (s *StatsService) CompletePrizePayment(competitionID, userID string) error 
 
 	log.Printf("✅ 입금 완료: Competition=%s, User=%s", competitionID, userID)
 	return nil
+}
+
+// ==================== Realtime Database 함수들 ====================
+
+// updateRealtimeSubmission - Realtime DB submission 업데이트
+func (s *StatsService) updateRealtimeSubmission(ctx context.Context, competitionID, submissionID string, data map[string]interface{}) error {
+	if s.realtimeDB == nil {
+		return nil
+	}
+
+	ref := s.realtimeDB.NewRef(fmt.Sprintf("realtime-stats/%s/submissions/%s", competitionID, submissionID))
+	
+	if err := ref.Set(ctx, data); err != nil {
+		log.Printf("⚠️ Realtime DB submission 업데이트 실패 [%s]: %v", submissionID, err)
+		return err
+	}
+
+	return nil
+}
+
+// updateRealtimeLeaderboard - Realtime DB leaderboard 업데이트
+func (s *StatsService) updateRealtimeLeaderboard(ctx context.Context, competitionID, creatorID string) error {
+	if s.realtimeDB == nil {
+		return nil
+	}
+
+	// 1. 해당 크리에이터의 모든 submissions 조회
+	submissionsRef := s.realtimeDB.NewRef(fmt.Sprintf("realtime-stats/%s/submissions", competitionID))
+	
+	var allSubmissions map[string]map[string]interface{}
+	if err := submissionsRef.Get(ctx, &allSubmissions); err != nil {
+		log.Printf("⚠️ Realtime DB submissions 조회 실패: %v", err)
+		return err
+	}
+
+	// 2. creatorID로 필터링하여 합산
+	var totalViews int64 = 0
+	var submissionCount int = 0
+	var creatorName string
+	var topVideo struct {
+		SubmissionID string
+		ViewCount    int64
+	}
+
+	for submissionID, submission := range allSubmissions {
+		// creatorId 체크 (interface{} 타입 처리)
+		subCreatorID, ok := submission["creatorId"].(string)
+		if !ok || subCreatorID != creatorID {
+			continue
+		}
+
+		// viewCount 추출
+		var viewCount int64
+		switch v := submission["viewCount"].(type) {
+		case int64:
+			viewCount = v
+		case float64:
+			viewCount = int64(v)
+		case int:
+			viewCount = int64(v)
+		default:
+			continue
+		}
+
+		totalViews += viewCount
+		submissionCount++
+
+		// creatorName 저장 (첫 번째 것만)
+		if creatorName == "" {
+			if name, ok := submission["creatorName"].(string); ok {
+				creatorName = name
+			}
+		}
+
+		// 최고 조회수 영상 찾기
+		if viewCount > topVideo.ViewCount {
+			topVideo.SubmissionID = submissionID
+			topVideo.ViewCount = viewCount
+		}
+	}
+
+	// 3. Leaderboard 업데이트
+	leaderboardRef := s.realtimeDB.NewRef(fmt.Sprintf("realtime-stats/%s/leaderboard/%s", competitionID, creatorID))
+	
+	leaderboardData := map[string]interface{}{
+		"creatorName":     creatorName,
+		"totalViews":      totalViews,
+		"submissionCount": submissionCount,
+		"lastUpdated":     time.Now().Unix(),
+	}
+
+	if topVideo.SubmissionID != "" {
+		leaderboardData["topVideo"] = map[string]interface{}{
+			"submissionId": topVideo.SubmissionID,
+			"viewCount":    topVideo.ViewCount,
+		}
+	}
+
+	if err := leaderboardRef.Set(ctx, leaderboardData); err != nil {
+		log.Printf("⚠️ Realtime DB leaderboard 업데이트 실패 [%s]: %v", creatorID, err)
+		return err
+	}
+
+	log.Printf("✅ Leaderboard 업데이트: %s - 조회수 %d (영상 %d개)", creatorName, totalViews, submissionCount)
+	return nil
+}
+
+// cleanupRealtimeData - 대회 종료 시 Realtime DB 데이터 삭제
+func (s *StatsService) cleanupRealtimeData(ctx context.Context, competitionID string) error {
+	if s.realtimeDB == nil {
+		return nil
+	}
+
+	ref := s.realtimeDB.NewRef(fmt.Sprintf("realtime-stats/%s", competitionID))
+	
+	if err := ref.Delete(ctx); err != nil {
+		log.Printf("⚠️ Realtime DB 정리 실패 [%s]: %v", competitionID, err)
+		return err
+	}
+
+	log.Printf("✅ Realtime DB 정리 완료: %s", competitionID)
+	return nil
+}
+
+// SaveDailyAggregation - 일별 데이터 집계
+func (s *StatsService) SaveDailyAggregation() error {
+	// TODO: 일별 데이터 집계 구현
+	return nil
+}
+
+// ⭐ 참가자 수 조회 (특정 DB 사용)
+func (s *StatsService) getParticipantsCountWithDB(ctx context.Context, competitionID string, db *firestore.Client) (int, error) {
+	iter := db.Collection("competitions").
+		Doc(competitionID).
+		Collection("participants").
+		Where("status", "==", "accepted").
+		Documents(ctx)
+
+	count := 0
+	for {
+		_, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		count++
+	}
+
+	return count, nil
+}
+
+// ⭐ submissions 조회 (특정 DB 사용)
+func (s *StatsService) getCompetitionSubmissionsWithDB(ctx context.Context, competitionID string, db *firestore.Client) ([]SubmissionData, error) {
+	log.Printf("📋 대회 submissions 조회 시작: %s", competitionID)
+
+	iter := db.Collection("competitions").
+		Doc(competitionID).
+		Collection("submissions").
+		Where("isDeleted", "==", "n").
+		Documents(ctx)
+
+	var submissions []SubmissionData
+	for {
+		doc, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			log.Printf("❌ submissions 조회 오류: %v", err)
+			return nil, err
+		}
+
+		data := doc.Data()
+
+		viewCount := getInt64FromData(data, "currentViewCount")
+		if viewCount == 0 {
+			viewCount = getInt64FromData(data, "viewCount")
+		}
+
+		platform := getStringFromData(data, "platform")
+		if platform == "" {
+			if _, hasYouTubeData := data["youtubeData"]; hasYouTubeData {
+				platform = "youtube"
+			}
+		}
+
+		videoID := getStringFromData(data, "videoId")
+		if videoID == "" && platform == "youtube" {
+			if youtubeData, ok := data["youtubeData"].(map[string]interface{}); ok {
+				if vid, ok := youtubeData["videoId"].(string); ok {
+					videoID = vid
+				} else if vid, ok := youtubeData["id"].(string); ok {
+					videoID = vid
+				}
+			}
+		}
+
+		submission := SubmissionData{
+			ID:               doc.Ref.ID,
+			CompetitionID:    competitionID,
+			CreatorID:        getStringFromData(data, "creatorId"),
+			CreatorName:      getStringFromData(data, "creatorName"),
+			Platform:         platform,
+			VideoID:          videoID,
+			CurrentViewCount: viewCount,
+		}
+
+		submissions = append(submissions, submission)
+	}
+
+	log.Printf("✅ 총 %d개 submissions 조회 완료", len(submissions))
+	return submissions, nil
 }
 
 

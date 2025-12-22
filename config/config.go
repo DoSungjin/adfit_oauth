@@ -45,13 +45,16 @@ type DatabaseConfig struct {
 }
 
 type FirebaseConfig struct {
-	ProjectID       string `yaml:"project_id"`
-	CredentialsPath string `yaml:"credentials_path"`
+	ProjectID        string `yaml:"project_id"`
+	DatabaseURL      string `yaml:"database_url"`
+	CredentialsPath  string `yaml:"credentials_path"`
+	TestDatabaseID   string `yaml:"test_database_id"`   // adtown-test
 }
 
 type OAuthConfig struct {
-	TikTok  OAuthProvider `yaml:"tiktok"`
-	YouTube OAuthProvider `yaml:"youtube"`
+	TikTok    OAuthProvider `yaml:"tiktok"`
+	YouTube   OAuthProvider `yaml:"youtube"`
+	Instagram OAuthProvider `yaml:"instagram"`
 }
 
 type OAuthProvider struct {
@@ -102,6 +105,7 @@ type SecurityConfig struct {
 type FeatureFlags struct {
 	TikTokEnabled    bool `yaml:"tiktok_enabled"`
 	YouTubeEnabled   bool `yaml:"youtube_enabled"`
+	InstagramEnabled bool `yaml:"instagram_enabled"`
 	StatsEnabled     bool `yaml:"stats_enabled"`
 	CronEnabled      bool `yaml:"cron_enabled"`
 	AnalyticsEnabled bool `yaml:"analytics_enabled"`
@@ -204,12 +208,29 @@ func applyEnvironmentVariables() {
 		Config.Stats.YouTubeAPIKey = apiKey  
 	}
 
+	// Instagram
+	if appID := os.Getenv("INSTAGRAM_APP_ID"); appID != "" {
+		Config.OAuth.Instagram.ClientID = appID
+	}
+	if appSecret := os.Getenv("INSTAGRAM_APP_SECRET"); appSecret != "" {
+		Config.OAuth.Instagram.ClientSecret = appSecret
+	}
+	if redirectURI := os.Getenv("INSTAGRAM_REDIRECT_URI"); redirectURI != "" {
+		Config.OAuth.Instagram.RedirectURI = redirectURI
+	}
+
 	
 	if projectID := os.Getenv("FIREBASE_PROJECT_ID"); projectID != "" {
 		Config.Firebase.ProjectID = projectID
 	}
+	if databaseURL := os.Getenv("FIREBASE_DATABASE_URL"); databaseURL != "" {
+		Config.Firebase.DatabaseURL = databaseURL
+	}
 	if credPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); credPath != "" {
 		Config.Firebase.CredentialsPath = credPath
+	}
+	if testDBID := os.Getenv("FIRESTORE_TEST_DATABASE_ID"); testDBID != "" {
+		Config.Firebase.TestDatabaseID = testDBID
 	}
 
 	
@@ -286,6 +307,8 @@ func IsFeatureEnabled(feature string) bool {
 		return Config.Features.TikTokEnabled
 	case "youtube":
 		return Config.Features.YouTubeEnabled
+	case "instagram":
+		return Config.Features.InstagramEnabled
 	case "stats":
 		return Config.Features.StatsEnabled
 	case "cron":
@@ -359,4 +382,15 @@ func GetStatsBatchSize() int {
 		return 50
 	}
 	return Config.Stats.BatchSize
+}
+
+// GetTestDatabaseID returns the test Firestore database ID
+func GetTestDatabaseID() string {
+	if Config == nil {
+		return "adtown-test"
+	}
+	if Config.Firebase.TestDatabaseID == "" {
+		return "adtown-test"
+	}
+	return Config.Firebase.TestDatabaseID
 }

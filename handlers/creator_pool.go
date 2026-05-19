@@ -181,6 +181,18 @@ func (h *CreatorPoolHandler) GetCreators(c *gin.Context) {
 	}
 	orderClause := fmt.Sprintf("%s %s NULLS LAST", col, dir)
 
+	// 전체 건수 (필터 동일, Order/Limit/Offset 제외) — 페이지 수 계산용
+	// GORM: Count 가 statement 를 변형하므로 세션 분리 후 호출 (이후 Find 영향 방지)
+	var total int64
+	if err := query.Session(&gorm.Session{}).Count(&total).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	totalPages := int((total + int64(limit) - 1) / int64(limit))
+	if totalPages < 1 {
+		totalPages = 1
+	}
+
 	// 데이터 조회 (limit+1개 가져와서 다음 페이지 여부 판단)
 	var creators []Creator
 	result := query.
@@ -205,9 +217,11 @@ func (h *CreatorPoolHandler) GetCreators(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"data": creators,
 		"pagination": gin.H{
-			"page":    page,
-			"limit":   limit,
-			"hasMore": hasMore,
+			"page":       page,
+			"limit":      limit,
+			"hasMore":    hasMore,
+			"total":      total,
+			"totalPages": totalPages,
 		},
 	})
 

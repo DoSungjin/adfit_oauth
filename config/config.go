@@ -7,10 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"gopkg.in/yaml.v3"
 	"golang.org/x/oauth2"
+	"gopkg.in/yaml.v3"
 )
-
 
 type AppConfig struct {
 	App          AppSettings          `yaml:"app"`
@@ -42,13 +41,14 @@ type DatabaseConfig struct {
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	DBName   string `yaml:"dbname"`
+	Instance string `yaml:"instance"` // Cloud SQL instance connection name
 }
 
 type FirebaseConfig struct {
-	ProjectID        string `yaml:"project_id"`
-	DatabaseURL      string `yaml:"database_url"`
-	CredentialsPath  string `yaml:"credentials_path"`
-	TestDatabaseID   string `yaml:"test_database_id"`   // adtown-test
+	ProjectID       string `yaml:"project_id"`
+	DatabaseURL     string `yaml:"database_url"`
+	CredentialsPath string `yaml:"credentials_path"`
+	TestDatabaseID  string `yaml:"test_database_id"` // adtown-test
 }
 
 type OAuthConfig struct {
@@ -76,14 +76,15 @@ type CORSConfig struct {
 }
 
 type StatsConfig struct {
-	UpdateToken   string `yaml:"update_token"`
-	YouTubeAPIKey string `yaml:"youtube_api_key"`
-	BatchSize     int    `yaml:"batch_size"`
+	UpdateToken    string   `yaml:"update_token"`
+	YouTubeAPIKey  string   `yaml:"youtube_api_key"`
+	YouTubeAPIKeys []string `yaml:"youtube_api_keys"` // 여러 개 API Key 로테이션용
+	BatchSize      int      `yaml:"batch_size"`
 }
 
 type CronConfig struct {
-	Enabled   bool               `yaml:"enabled"`
-	Schedules map[string]string  `yaml:"schedules"`
+	Enabled   bool              `yaml:"enabled"`
+	Schedules map[string]string `yaml:"schedules"`
 }
 
 type LoggingConfig struct {
@@ -111,13 +112,11 @@ type FeatureFlags struct {
 	AnalyticsEnabled bool `yaml:"analytics_enabled"`
 }
 
-
 var (
-	Config           *AppConfig
-	TikTokOAuth2Config *oauth2.Config
+	Config              *AppConfig
+	TikTokOAuth2Config  *oauth2.Config
 	YouTubeOAuth2Config *oauth2.Config
 )
-
 
 func LoadConfig(configPath string) error {
 	if configPath == "" {
@@ -148,7 +147,6 @@ func LoadConfig(configPath string) error {
 	return nil
 }
 
-
 func applyEnvironmentOverrides() {
 	env := Config.App.Environment
 	if envConfig, exists := Config.Environments[env]; exists {
@@ -173,9 +171,8 @@ func applyEnvironmentOverrides() {
 	}
 }
 
-
 func applyEnvironmentVariables() {
-	
+
 	if port := os.Getenv("PORT"); port != "" {
 		Config.App.Port = port
 	}
@@ -183,7 +180,6 @@ func applyEnvironmentVariables() {
 		Config.App.Environment = env
 	}
 
-	
 	if clientKey := os.Getenv("TIKTOK_CLIENT_KEY"); clientKey != "" {
 		Config.OAuth.TikTok.ClientID = clientKey
 	}
@@ -193,19 +189,42 @@ func applyEnvironmentVariables() {
 	if redirectURI := os.Getenv("TIKTOK_REDIRECT_URI"); redirectURI != "" {
 		Config.OAuth.TikTok.RedirectURI = redirectURI
 	}
-	
-	
+
 	if clientID := os.Getenv("YOUTUBE_CLIENT_ID"); clientID != "" {
 		Config.OAuth.YouTube.ClientID = clientID
 	}
 	if clientSecret := os.Getenv("YOUTUBE_CLIENT_SECRET"); clientSecret != "" {
 		Config.OAuth.YouTube.ClientSecret = clientSecret
 	}
-	
+
 	// YouTube Data API Key (Browser Key)
 	if apiKey := os.Getenv("YOUTUBE_API_KEY"); apiKey != "" {
 		Config.OAuth.YouTube.APIKey = apiKey
-		Config.Stats.YouTubeAPIKey = apiKey  
+		Config.Stats.YouTubeAPIKey = apiKey
+	}
+	// YouTube API Keys (여러 개, 쉼표로 구분)
+	if apiKeys := os.Getenv("YOUTUBE_API_KEYS"); apiKeys != "" {
+		Config.Stats.YouTubeAPIKeys = strings.Split(apiKeys, ",")
+		for i := range Config.Stats.YouTubeAPIKeys {
+			Config.Stats.YouTubeAPIKeys[i] = strings.TrimSpace(Config.Stats.YouTubeAPIKeys[i])
+		}
+	}
+
+	// Database
+	if dbHost := os.Getenv("DB_HOST"); dbHost != "" {
+		Config.Database.Host = dbHost
+	}
+	if dbUser := os.Getenv("DB_USER"); dbUser != "" {
+		Config.Database.User = dbUser
+	}
+	if dbPassword := os.Getenv("DB_PASSWORD"); dbPassword != "" {
+		Config.Database.Password = dbPassword
+	}
+	if dbName := os.Getenv("DB_NAME"); dbName != "" {
+		Config.Database.DBName = dbName
+	}
+	if instance := os.Getenv("CLOUD_SQL_INSTANCE"); instance != "" {
+		Config.Database.Instance = instance
 	}
 
 	// Instagram
@@ -219,7 +238,6 @@ func applyEnvironmentVariables() {
 		Config.OAuth.Instagram.RedirectURI = redirectURI
 	}
 
-	
 	if projectID := os.Getenv("FIREBASE_PROJECT_ID"); projectID != "" {
 		Config.Firebase.ProjectID = projectID
 	}
@@ -233,20 +251,17 @@ func applyEnvironmentVariables() {
 		Config.Firebase.TestDatabaseID = testDBID
 	}
 
-	
 	if token := os.Getenv("STATS_UPDATE_TOKEN"); token != "" {
 		Config.Stats.UpdateToken = token
 	}
 
-	
 	if secret := os.Getenv("JWT_SECRET"); secret != "" {
 		Config.Security.JWTSecret = secret
 	}
 }
 
-
 func initOAuth2Configs() {
-	
+
 	TikTokOAuth2Config = &oauth2.Config{
 		ClientID:     Config.OAuth.TikTok.ClientID,
 		ClientSecret: Config.OAuth.TikTok.ClientSecret,
@@ -258,7 +273,6 @@ func initOAuth2Configs() {
 		},
 	}
 
-	
 	YouTubeOAuth2Config = &oauth2.Config{
 		ClientID:     Config.OAuth.YouTube.ClientID,
 		ClientSecret: Config.OAuth.YouTube.ClientSecret,
@@ -270,7 +284,6 @@ func initOAuth2Configs() {
 		},
 	}
 }
-
 
 func InitOAuth2() {
 	if Config == nil {
@@ -287,7 +300,6 @@ func InitOAuth2() {
 	// log.Printf("  YouTube API Key: %s", maskString(Config.OAuth.YouTube.APIKey))
 }
 
-
 func GetCronSchedule(name string) (string, bool) {
 	if Config == nil || !Config.Cron.Enabled {
 		return "", false
@@ -296,12 +308,11 @@ func GetCronSchedule(name string) (string, bool) {
 	return schedule, exists
 }
 
-
 func IsFeatureEnabled(feature string) bool {
 	if Config == nil {
 		return false
 	}
-	
+
 	switch strings.ToLower(feature) {
 	case "tiktok":
 		return Config.Features.TikTokEnabled
@@ -320,14 +331,12 @@ func IsFeatureEnabled(feature string) bool {
 	}
 }
 
-
 func GetLogLevel() string {
 	if Config == nil {
 		return "info"
 	}
 	return Config.Logging.Level
 }
-
 
 func GetPort() string {
 	if Config == nil {
@@ -336,14 +345,12 @@ func GetPort() string {
 	return Config.App.Port
 }
 
-
 func IsDebugMode() bool {
 	if Config == nil {
 		return false
 	}
 	return Config.App.Debug
 }
-
 
 func maskString(s string) string {
 	if len(s) <= 4 {
@@ -352,14 +359,12 @@ func maskString(s string) string {
 	return s[:4] + strings.Repeat("*", len(s)-4)
 }
 
-
 func GetDatabasePath() string {
 	if Config == nil {
 		return "adfit.db"
 	}
 	return Config.Database.Path
 }
-
 
 func GetStatsUpdateToken() string {
 	if Config == nil {
@@ -368,7 +373,6 @@ func GetStatsUpdateToken() string {
 	return Config.Stats.UpdateToken
 }
 
-
 func GetYouTubeAPIKey() string {
 	if Config == nil {
 		return ""
@@ -376,6 +380,36 @@ func GetYouTubeAPIKey() string {
 	return Config.Stats.YouTubeAPIKey
 }
 
+// GetYouTubeAPIKeys returns all YouTube API keys for rotation
+func GetYouTubeAPIKeys() []string {
+	// 1. 환경변수에서 직접 먼저 확인 (Config 로드 실패 시에도 작동)
+	if apiKeys := os.Getenv("YOUTUBE_API_KEYS"); apiKeys != "" {
+		keys := strings.Split(apiKeys, ",")
+		for i := range keys {
+			keys[i] = strings.TrimSpace(keys[i])
+		}
+		if len(keys) > 0 && keys[0] != "" {
+			return keys
+		}
+	}
+
+	// 2. Config에서 확인
+	if Config != nil {
+		if len(Config.Stats.YouTubeAPIKeys) > 0 {
+			return Config.Stats.YouTubeAPIKeys
+		}
+		if Config.Stats.YouTubeAPIKey != "" {
+			return []string{Config.Stats.YouTubeAPIKey}
+		}
+	}
+
+	// 3. 단일 API Key 환경변수
+	if apiKey := os.Getenv("YOUTUBE_API_KEY"); apiKey != "" {
+		return []string{apiKey}
+	}
+
+	return nil
+}
 
 func GetStatsBatchSize() int {
 	if Config == nil {

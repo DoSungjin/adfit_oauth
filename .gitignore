@@ -3,6 +3,9 @@
 # 바이너리
 adfit-server
 *.exe
+/main
+/backend
+/adfit-oauth
 
 # 데이터베이스
 *.db
@@ -23,6 +26,8 @@ firebase-key.json
 .env.local
 .env.production
 .env.yaml
+env-vars.yaml
+env-vars*.yaml
 deploy.yaml
 env_no_port.yaml
 deploy_complete.bat
@@ -34,6 +39,8 @@ deploy.ps1
 deploy.sh
 update_env.ps1
 cloudbuild.yaml
+DEPLOY.md
+_deprecated_deploy.ps1
 
 # 로그
 logs/
@@ -75,3 +82,10 @@ backup/
 test/output/
 test/*.json
 test/*.xlsx
+
+# 크리에이터 데이터 산출물 (대용량 CSV - 저장소 제외)
+scripts/output/
+*.csv
+
+# 비활성화/삭제 표시 파일
+*.rmrmrm

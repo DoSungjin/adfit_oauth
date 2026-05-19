@@ -73,6 +73,15 @@ func (h *InstagramHandler) HandleCallback(c *gin.Context) {
 	errorParam := c.Query("error")
 	errorReason := c.Query("error_reason")
 
+	// ⭐ 직접 접속 시 안내 페이지
+	if code == "" && state == "" && errorParam == "" {
+		c.JSON(200, gin.H{
+			"endpoint": "Instagram OAuth Callback",
+			"status":   "ready",
+		})
+		return
+	}
+
 	fmt.Printf("📸 Instagram Callback - Code: %s, State: %s, Error: %s\n", code, state, errorParam)
 
 	if errorParam != "" {
@@ -356,22 +365,20 @@ func (h *InstagramHandler) GetMedia(c *gin.Context) {
 	var result map[string]interface{}
 	json.Unmarshal(body, &result)
 
-	// ⭐ 각 미디어에 대해 조회수(plays) 조회 추가
+	// ⭐ 각 미디어에 대해 조회수 조회 추가 (타입별 다른 metric)
 	if data, ok := result["data"].([]interface{}); ok {
 		for i, item := range data {
 			if media, ok := item.(map[string]interface{}); ok {
-				mediaID := media["id"].(string)
+				mediaID, _ := media["id"].(string)
 				mediaType := ""
 				if mt, ok := media["media_type"].(string); ok {
 					mediaType = mt
 				}
 
-				// VIDEO 또는 REELS인 경우에만 plays 조회
-				if mediaType == "VIDEO" || mediaType == "REELS" {
-					plays := h.getMediaPlays(mediaID, userToken.AccessToken)
-					media["view_count"] = plays
-					data[i] = media
-				}
+				// 모든 미디어 타입에 대해 Insights 조회
+				viewCount := h.getMediaPlays(mediaID, userToken.AccessToken, mediaType)
+				media["view_count"] = viewCount
+				data[i] = media
 			}
 		}
 		result["data"] = data
@@ -380,12 +387,16 @@ func (h *InstagramHandler) GetMedia(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-// getMediaPlays - 미디어의 재생 횟수(조회수) 조회
-func (h *InstagramHandler) getMediaPlays(mediaID, accessToken string) int {
-	// Reels/Video용 metrics: plays
+// getMediaPlays - 미디어의 조회수 조회
+// mediaType: VIDEO, REELS, IMAGE, CAROUSEL_ALBUM
+func (h *InstagramHandler) getMediaPlays(mediaID, accessToken string, mediaType string) int {
+	// ⭐ 모든 미디어 타입에 대해 views 사용 (Instagram API 2024+)
+	metrics := "views"
+
 	reqURL := fmt.Sprintf(
-		"https://graph.instagram.com/%s/insights?metric=plays&access_token=%s",
+		"https://graph.instagram.com/%s/insights?metric=%s&access_token=%s",
 		mediaID,
+		metrics,
 		accessToken,
 	)
 
@@ -422,10 +433,10 @@ func (h *InstagramHandler) getMediaPlays(mediaID, accessToken string) int {
 		return 0
 	}
 
-	// plays 값 추출
+	// 값 추출 (plays, video_views, impressions 중 하나)
 	for _, metric := range result.Data {
-		if metric.Name == "plays" && len(metric.Values) > 0 {
-			fmt.Printf("✅ Instagram plays for %s: %d\n", mediaID, metric.Values[0].Value)
+		if len(metric.Values) > 0 {
+			fmt.Printf("✅ Instagram %s for %s: %d\n", metric.Name, mediaID, metric.Values[0].Value)
 			return metric.Values[0].Value
 		}
 	}
@@ -433,11 +444,23 @@ func (h *InstagramHandler) getMediaPlays(mediaID, accessToken string) int {
 	return 0
 }
 
-// ==================== 5. 미디어 Insights (조회수) ====================
+// ==================== 5. 미디어 Insights ====================
 
+// GetMediaInsights - 미디어 타입별 상세 인사이트 조회
+// instagram_business_manage_insights 권한 필요
+//
+// 지원 metric 목록 (공식 문서 기준, 2024+):
+//   FEED/REELS 공통: views, reach, likes, comments, saved, shares, total_interactions, profile_visits, follows
+//   FEED 전용:       profile_activity(breakdown=action_type)
+//   REELS 전용:      ig_reels_avg_watch_time, ig_reels_video_view_total_time
+//   STORY 전용:      navigation(breakdown=story_navigation_action_type), replies
+//
+// ⚠️ 국가/나이/성별 breakdown은 개별 미디어 레벨에서 Instagram API가 제공하지 않음.
+//    계정 전체 레벨(GET /<USER_ID>/insights)에서만 제공됨.
 func (h *InstagramHandler) GetMediaInsights(c *gin.Context) {
 	userID := c.GetString("user_id")
 	mediaID := c.Param("mediaId")
+	mediaType := c.DefaultQuery("media_type", "FEED") // FEED, REELS, STORY
 
 	var userToken models.UserToken
 	if err := h.DB.Where("user_id = ? AND platform = ?", userID, "instagram").First(&userToken).Error; err != nil {
@@ -445,31 +468,85 @@ func (h *InstagramHandler) GetMediaInsights(c *gin.Context) {
 		return
 	}
 
-	// ⭐ VIDEO/REEL: plays (조회수), reach, saved, shares, total_interactions
-	// IMAGE/CAROUSEL: impressions, reach
-	metrics := "plays,reach,saved,shares,total_interactions"
+	insightsData := h.fetchDetailedMediaInsights(mediaID, userToken.AccessToken, mediaType)
+	c.JSON(http.StatusOK, insightsData)
+}
 
+// fetchDetailedMediaInsights - 미디어 타입별 인사이트 조회 (내부 함수)
+func (h *InstagramHandler) fetchDetailedMediaInsights(mediaID, accessToken, mediaType string) map[string]interface{} {
+	result := map[string]interface{}{"mediaId": mediaID, "mediaType": mediaType}
+
+	// 1️⃣ 공통 기본 metrics (FEED, REELS)
+	if mediaType != "STORY" {
+		metrics := "views,reach,likes,comments,saved,shares,total_interactions,profile_visits,follows"
+		if data := h.callInsightsAPI(mediaID, accessToken, metrics, ""); data != nil {
+			result["basic"] = data
+		}
+	}
+
+	// 2️⃣ REELS 전용: 평균 시청시간, 총 재생시간
+	if mediaType == "REELS" {
+		reelsMetrics := "ig_reels_avg_watch_time,ig_reels_video_view_total_time"
+		if data := h.callInsightsAPI(mediaID, accessToken, reelsMetrics, ""); data != nil {
+			result["reels"] = data
+		}
+	}
+
+	// 3️⃣ FEED 전용: 프로필 방문 후 행동 breakdown
+	if mediaType == "FEED" {
+		if data := h.callInsightsAPI(mediaID, accessToken, "profile_activity", "action_type"); data != nil {
+			result["profileActivity"] = data
+		}
+	}
+
+	// 4️⃣ STORY 전용: 도달, 공유, 답글, 내비게이션
+	if mediaType == "STORY" {
+		storyMetrics := "reach,shares,replies,total_interactions"
+		if data := h.callInsightsAPI(mediaID, accessToken, storyMetrics, ""); data != nil {
+			result["basic"] = data
+		}
+		if data := h.callInsightsAPI(mediaID, accessToken, "navigation", "story_navigation_action_type"); data != nil {
+			result["navigation"] = data
+		}
+	}
+
+	return result
+}
+
+// callInsightsAPI - Instagram Insights API 단일 호출
+func (h *InstagramHandler) callInsightsAPI(mediaID, accessToken, metrics, breakdown string) []interface{} {
 	reqURL := fmt.Sprintf(
-		"https://graph.instagram.com/%s/insights?metric=%s&access_token=%s",
-		mediaID,
-		metrics,
-		userToken.AccessToken,
+		"https://graph.instagram.com/v21.0/%s/insights?metric=%s&access_token=%s",
+		mediaID, metrics, accessToken,
 	)
+	if breakdown != "" {
+		reqURL += "&breakdown=" + breakdown
+	}
 
 	resp, err := http.Get(reqURL)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		fmt.Printf("⚠️ Instagram Insights API 오류 [%s/%s]: %v\n", mediaID, metrics, err)
+		return nil
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	fmt.Printf("📸 Instagram Insights Response [%s]: %s\n", mediaID, string(body))
+	fmt.Printf("📸 Instagram Insights [%s] metrics=%s: %s\n", mediaID, metrics, string(body))
 
-	var result map[string]interface{}
-	json.Unmarshal(body, &result)
-
-	c.JSON(http.StatusOK, result)
+	var result struct {
+		Data  []interface{} `json:"data"`
+		Error struct {
+			Message string `json:"message"`
+			Code    int    `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil || result.Error.Code != 0 {
+		if result.Error.Code != 0 {
+			fmt.Printf("⚠️ Instagram API error [%s]: %s\n", mediaID, result.Error.Message)
+		}
+		return nil
+	}
+	return result.Data
 }
 
 // ==================== 6. 테스트용 엔드포인트 ====================
@@ -506,36 +583,19 @@ func (h *InstagramHandler) TestGetMedia(c *gin.Context) {
 }
 
 // TestGetInsights - 직접 Token으로 Insights 조회 (PowerShell 테스트용)
+// ?access_token=xxx&media_type=FEED|REELS|STORY
 func (h *InstagramHandler) TestGetInsights(c *gin.Context) {
 	accessToken := c.Query("access_token")
 	mediaID := c.Param("mediaId")
+	mediaType := c.DefaultQuery("media_type", "FEED")
 
 	if accessToken == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "access_token required"})
 		return
 	}
 
-	// ⭐ VIDEO/REEL: plays (조회수)
-	metrics := "plays,reach,saved,shares,total_interactions"
-
-	reqURL := fmt.Sprintf(
-		"https://graph.instagram.com/%s/insights?metric=%s&access_token=%s",
-		mediaID,
-		metrics,
-		accessToken,
-	)
-
-	resp, err := http.Get(reqURL)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	fmt.Printf("📸 [TEST] Instagram Insights [%s]: %s\n", mediaID, string(body))
-
-	c.Data(resp.StatusCode, "application/json", body)
+	result := h.fetchDetailedMediaInsights(mediaID, accessToken, mediaType)
+	c.JSON(http.StatusOK, result)
 }
 
 // TestGetUser - 직접 Token으로 사용자 정보 조회
@@ -682,6 +742,16 @@ func (h *InstagramHandler) DataDeletion(c *gin.Context) {
 	})
 }
 
+// DataDeletionStatus - 데이터 삭제 엔드포인트 상태 확인 (GET)
+func (h *InstagramHandler) DataDeletionStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"endpoint":    "Instagram Data Deletion Callback",
+		"status":      "ready",
+		"description": "This endpoint handles user data deletion requests from Facebook as required by platform policy.",
+		"method":      "POST (from Facebook)",
+	})
+}
+
 // Deauthorize - Instagram 연동 해제 콜백
 func (h *InstagramHandler) Deauthorize(c *gin.Context) {
 	signedRequest := c.PostForm("signed_request")
@@ -713,6 +783,16 @@ func (h *InstagramHandler) Deauthorize(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
+// DeauthorizeStatus - 연동 해제 엔드포인트 상태 확인 (GET)
+func (h *InstagramHandler) DeauthorizeStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"endpoint":    "Instagram Deauthorize Callback",
+		"status":      "ready",
+		"description": "This endpoint handles Instagram app deauthorization requests from Facebook.",
+		"method":      "POST (from Facebook)",
+	})
+}
+
 // ==================== 11. 영상 제출 (대회 참가) ====================
 
 func (h *InstagramHandler) SubmitVideo(c *gin.Context) {
@@ -730,6 +810,7 @@ func (h *InstagramHandler) SubmitVideo(c *gin.Context) {
 		MediaType     string `json:"mediaType"` // IMAGE, VIDEO, CAROUSEL_ALBUM
 		Caption       string `json:"caption"`
 		ThumbnailURL  string `json:"thumbnailUrl"`
+		ViewCount     int    `json:"viewCount"`
 		LikeCount     int    `json:"likeCount"`
 		CommentsCount int    `json:"commentsCount"`
 		CreatorName   string `json:"creatorName"`
@@ -777,6 +858,20 @@ func (h *InstagramHandler) SubmitVideo(c *gin.Context) {
 		fmt.Printf("🧪 Using adtown-test DB for Instagram submission\n")
 	}
 
+	// ⭐ 성과형 대회 정보 조회
+	compDoc, err := competitionDB.Collection("competitions").Doc(req.CompetitionID).Get(ctx)
+	var estimatedEarnings int64 = 0
+	if err == nil {
+		data := compDoc.Data()
+		if data["competitionType"] == "performance" {
+			pricePerView := getInt64(data, "pricePerView")
+			minViews := getInt64(data, "minViews")
+			if int64(req.ViewCount) >= minViews {
+				estimatedEarnings = int64(req.ViewCount) * pricePerView
+			}
+		}
+	}
+
 	// Firestore에 저장
 	submissionRef := competitionDB.Collection("competitions").Doc(req.CompetitionID).
 		Collection("submissions").NewDoc()
@@ -788,7 +883,9 @@ func (h *InstagramHandler) SubmitVideo(c *gin.Context) {
 		"videoUrl":      req.Permalink, // Instagram permalink
 		"videoTitle":    req.Caption,
 		"thumbnailUrl":  req.ThumbnailURL,
-		"viewCount":     0, // Insights에서 나중에 업데이트
+		"viewCount":     req.ViewCount,
+		"currentViewCount": req.ViewCount,
+		"estimatedEarnings": estimatedEarnings, // ⭐ 성과형
 		"likeCount":     req.LikeCount,
 		"commentCount":  req.CommentsCount,
 		"platform":      "instagram",
@@ -820,6 +917,7 @@ func (h *InstagramHandler) SubmitVideo(c *gin.Context) {
 
 	batch.Update(participantRef, []firestore.Update{
 		{Path: "submissionCount", Value: firestore.Increment(1)},
+		{Path: "totalViewCount", Value: firestore.Increment(req.ViewCount)},
 		{Path: "lastSubmittedAt", Value: firestore.ServerTimestamp},
 	})
 
@@ -834,4 +932,18 @@ func (h *InstagramHandler) SubmitVideo(c *gin.Context) {
 		"success":      true,
 		"submissionId": submissionRef.ID,
 	})
+}
+
+// getInt64 - 데이터에서 int64 추출
+func getInt64(data map[string]interface{}, key string) int64 {
+	switch v := data[key].(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	default:
+		return 0
+	}
 }

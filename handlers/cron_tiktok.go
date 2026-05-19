@@ -45,6 +45,13 @@ type TikTokVideoStats struct {
 	ShareCount   int64
 }
 
+// TikTokPerformanceInfo - 성과형 대회 정보
+type TikTokPerformanceInfo struct {
+	IsPerformance bool
+	PricePerView  int64
+	MinViews      int64
+}
+
 // TikTokTokenResponse - TikTok Token 응답 구조
 type TikTokTokenResponse struct {
 	AccessToken  string
@@ -264,14 +271,25 @@ func (h *TikTokCronHandler) updateTikTokStatsCore() TikTokUpdateResult {
 				continue
 			}
 
+			// ⭐ 성과형 대회 정보 조회 (competitionID로 1회만)
+			var estimatedEarnings int64 = 0
+			perfInfo := h.getCompetitionPerformanceInfo(ctx, competitionID)
+			if perfInfo.IsPerformance && stats.ViewCount >= perfInfo.MinViews {
+				estimatedEarnings = stats.ViewCount * perfInfo.PricePerView
+			}
+
 			// 5️⃣ Firestore submissions 업데이트
-			_, err = subDoc.Ref.Update(ctx, []firestore.Update{
+			updates := []firestore.Update{
 				{Path: "currentViewCount", Value: stats.ViewCount},
 				{Path: "likeCount", Value: stats.LikeCount},
 				{Path: "commentCount", Value: stats.CommentCount},
 				{Path: "shareCount", Value: stats.ShareCount},
 				{Path: "lastStatsUpdate", Value: firestore.ServerTimestamp},
-			})
+			}
+			if perfInfo.IsPerformance {
+				updates = append(updates, firestore.Update{Path: "estimatedEarnings", Value: estimatedEarnings})
+			}
+			_, err = subDoc.Ref.Update(ctx, updates)
 
 			if err != nil {
 				log.Printf("❌ Firestore 업데이트 실패 [%s]: %v", submissionID, err)
@@ -282,15 +300,16 @@ func (h *TikTokCronHandler) updateTikTokStatsCore() TikTokUpdateResult {
 			// 6️⃣ ⭐ Realtime DB 업데이트 (YouTube와 동일한 방식)
 			if h.realtimeDB != nil {
 				realtimeData := map[string]interface{}{
-					"creatorId":    creatorID,
-					"creatorName":  creatorName,
-					"platform":     "tiktok",
-					"videoId":      videoID,
-					"viewCount":    stats.ViewCount,
-					"likeCount":    stats.LikeCount,
-					"commentCount": stats.CommentCount,
-					"shareCount":   stats.ShareCount,
-					"lastUpdated":  time.Now().Unix(),
+					"creatorId":         creatorID,
+					"creatorName":       creatorName,
+					"platform":          "tiktok",
+					"videoId":           videoID,
+					"viewCount":         stats.ViewCount,
+					"likeCount":         stats.LikeCount,
+					"commentCount":      stats.CommentCount,
+					"shareCount":        stats.ShareCount,
+					"estimatedEarnings": estimatedEarnings, // ⭐ 성과형
+					"lastUpdated":       time.Now().Unix(),
 				}
 
 				if err := h.updateRealtimeSubmission(ctx, competitionID, submissionID, realtimeData); err != nil {
@@ -519,6 +538,7 @@ func (h *TikTokCronHandler) updateRealtimeLeaderboard(ctx context.Context, compe
 	// 2. creatorID로 필터링하여 합산
 	var totalViews int64 = 0
 	var totalLikes int64 = 0
+	var totalEstimatedEarnings int64 = 0 // ⭐ 성과형 추가
 	var submissionCount int = 0
 	var creatorName string
 	var topVideo struct {
@@ -555,6 +575,18 @@ func (h *TikTokCronHandler) updateRealtimeLeaderboard(ctx context.Context, compe
 			likeCount = int64(v)
 		}
 
+		// ⭐ estimatedEarnings 추출
+		var earnings int64
+		switch v := submission["estimatedEarnings"].(type) {
+		case int64:
+			earnings = v
+		case float64:
+			earnings = int64(v)
+		case int:
+			earnings = int64(v)
+		}
+		totalEstimatedEarnings += earnings
+
 		totalViews += viewCount
 		totalLikes += likeCount
 		submissionCount++
@@ -583,11 +615,12 @@ func (h *TikTokCronHandler) updateRealtimeLeaderboard(ctx context.Context, compe
 	leaderboardRef := h.realtimeDB.NewRef(fmt.Sprintf("realtime-stats/%s/leaderboard/%s", competitionID, creatorID))
 
 	leaderboardData := map[string]interface{}{
-		"creatorName":     creatorName,
-		"totalViews":      totalViews,
-		"totalLikes":      totalLikes,
-		"submissionCount": submissionCount,
-		"lastUpdated":     time.Now().Unix(),
+		"creatorName":            creatorName,
+		"totalViews":             totalViews,
+		"totalLikes":             totalLikes,
+		"totalEstimatedEarnings": totalEstimatedEarnings, // ⭐ 성과형
+		"submissionCount":        submissionCount,
+		"lastUpdated":            time.Now().Unix(),
 	}
 
 	if topVideo.SubmissionID != "" {
@@ -601,8 +634,46 @@ func (h *TikTokCronHandler) updateRealtimeLeaderboard(ctx context.Context, compe
 		return fmt.Errorf("leaderboard 업데이트 실패: %w", err)
 	}
 
-	log.Printf("✅ Leaderboard 업데이트: %s - 조회수 %d (영상 %d개)", creatorName, totalViews, submissionCount)
+	log.Printf("✅ Leaderboard 업데이트: %s - 조회수 %d, 예상수익 %d (영상 %d개)", creatorName, totalViews, totalEstimatedEarnings, submissionCount)
 	return nil
+}
+
+// getCompetitionPerformanceInfo - 성과형 대회 정보 조회
+func (h *TikTokCronHandler) getCompetitionPerformanceInfo(ctx context.Context, competitionID string) *TikTokPerformanceInfo {
+	doc, err := h.firestore.Collection("competitions").Doc(competitionID).Get(ctx)
+	if err != nil {
+		return &TikTokPerformanceInfo{IsPerformance: false}
+	}
+	data := doc.Data()
+
+	compType, _ := data["competitionType"].(string)
+	if compType != "performance" {
+		return &TikTokPerformanceInfo{IsPerformance: false}
+	}
+
+	var pricePerView, minViews int64
+	switch v := data["pricePerView"].(type) {
+	case int64:
+		pricePerView = v
+	case float64:
+		pricePerView = int64(v)
+	case int:
+		pricePerView = int64(v)
+	}
+	switch v := data["minViews"].(type) {
+	case int64:
+		minViews = v
+	case float64:
+		minViews = int64(v)
+	case int:
+		minViews = int64(v)
+	}
+
+	return &TikTokPerformanceInfo{
+		IsPerformance: true,
+		PricePerView:  pricePerView,
+		MinViews:      minViews,
+	}
 }
 
 // updateCompetitionStats - 대회 전체 통계 계산 및 Realtime DB 업데이트

@@ -11,6 +11,7 @@ import (
 
 type AdminStatsHandler struct {
 	statsService *services.StatsService
+	mockService  *services.MockDataService
 }
 
 func NewAdminStatsHandler() (*AdminStatsHandler, error) {
@@ -19,8 +20,14 @@ func NewAdminStatsHandler() (*AdminStatsHandler, error) {
 		return nil, err
 	}
 
+	mockService, mockErr := services.NewMockDataService()
+	if mockErr != nil {
+		log.Printf("⚠️ MockDataService 초기화 실패: %v", mockErr)
+	}
+
 	return &AdminStatsHandler{
 		statsService: statsService,
+		mockService:  mockService,
 	}, nil
 }
 
@@ -187,6 +194,68 @@ func (h *AdminStatsHandler) UpdateSingleCompetitionStats(c *gin.Context) {
 		"message": "대회 통계가 성공적으로 업데이트되었습니다",
 		"competitionId": competitionID,
 	})
+}
+
+// InjectMockReport - 테스트용 Mock 리포트 데이터 주입
+func (h *AdminStatsHandler) InjectMockReport(c *gin.Context) {
+	competitionID := c.Param("competitionId")
+	if competitionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "대회 ID가 필요합니다"})
+		return
+	}
+	if h.mockService == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "MockDataService 미초기화"})
+		return
+	}
+
+	log.Printf("🧪 Admin 요청: Mock 리포트 주입 - %s", competitionID)
+	if err := h.mockService.InjectMockReport(c.Request.Context(), competitionID); err != nil {
+		log.Printf("❌ Mock 주입 실패: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "Mock 주입 실패", "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Mock 리포트 데이터가 주입되었습니다", "competitionId": competitionID})
+}
+
+// CleanupMockReport - Mock 리포트 데이터 정리 (isMockData=true 표시된 문서만)
+func (h *AdminStatsHandler) CleanupMockReport(c *gin.Context) {
+	competitionID := c.Param("competitionId")
+	if competitionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "대회 ID가 필요합니다"})
+		return
+	}
+	if h.mockService == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "MockDataService 미초기화"})
+		return
+	}
+
+	log.Printf("🧹 Admin 요청: Mock 리포트 정리 - %s", competitionID)
+	if err := h.mockService.CleanupMockReport(c.Request.Context(), competitionID); err != nil {
+		log.Printf("❌ Mock 정리 실패: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "Mock 정리 실패", "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Mock 데이터가 정리되었습니다", "competitionId": competitionID})
+}
+
+// CheckMockData - 실데이터(non-mock) 존재 여부 확인
+func (h *AdminStatsHandler) CheckMockData(c *gin.Context) {
+	competitionID := c.Param("competitionId")
+	if competitionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "대회 ID가 필요합니다"})
+		return
+	}
+	if h.mockService == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "message": "MockDataService 미초기화"})
+		return
+	}
+
+	hasReal, err := h.mockService.HasRealReportData(c.Request.Context(), competitionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "hasRealData": hasReal})
 }
 
 // CompletePrizePayment - ⭐ 상금 입금 완료 처리

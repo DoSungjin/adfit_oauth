@@ -8,14 +8,15 @@ app:
 
 # Database Configuration
 database:
-  type: "sqlite"
-  path: "adfit.db"
-  # For PostgreSQL/MySQL (future)
-  # host: "localhost"
-  # port: 5432
-  # user: "adfit"
-  # password: "password"
-  # dbname: "adfit"
+  type: "postgres"
+  # path: "adfit.db"  # SQLite fallback (local dev only)
+  host: "localhost"  # 환경변수: DB_HOST
+  port: 5432         # 환경변수: DB_PORT
+  user: "adtown"    # 환경변수: DB_USER
+  password: ""      # 환경변수: DB_PASSWORD
+  dbname: "adtown"  # 환경변수: DB_NAME
+  # Cloud SQL (Cloud Run): 환경변수 CLOUD_SQL_INSTANCE 설정 시 Unix Socket 사용
+  instance: ""      # 환경변수: CLOUD_SQL_INSTANCE (예: posted-app-c4ff5:asia-northeast3:adtown-db)
 
 # Firebase Configuration  
 firebase:

@@ -85,6 +85,15 @@ func (h *TikTokHandler) HandleCallback(c *gin.Context) {
 	state := c.Query("state")
 	errorParam := c.Query("error")
 
+	// ⭐ 직접 접속 시 안내 페이지
+	if code == "" && state == "" && errorParam == "" {
+		c.JSON(200, gin.H{
+			"endpoint": "TikTok OAuth Callback",
+			"status":   "ready",
+		})
+		return
+	}
+
 	fmt.Printf("🔵 Callback received - Code: %s, State: %s, Error: %s\n", code, state, errorParam)
 
 	// 에러 처리
@@ -775,6 +784,20 @@ func (h *TikTokHandler) SubmitVideo(c *gin.Context) {
 		fmt.Printf("📦 Using default DB for competition: %s\n", req.CompetitionID)
 	}
 
+	// ⭐ 성과형 대회 정보 조회
+	compDoc, err := competitionDB.Collection("competitions").Doc(req.CompetitionID).Get(ctx)
+	var estimatedEarnings int64 = 0
+	if err == nil {
+		data := compDoc.Data()
+		if data["competitionType"] == "performance" {
+			pricePerView := getTikTokInt64(data, "pricePerView")
+			minViews := getTikTokInt64(data, "minViews")
+			if int64(req.ViewCount) >= minViews {
+				estimatedEarnings = int64(req.ViewCount) * pricePerView
+			}
+		}
+	}
+
 	// Firestore에 저장할 데이터 준비 (올바른 DB 사용)
 	submissionRef := competitionDB.Collection("competitions").Doc(req.CompetitionID).
 		Collection("submissions").NewDoc()
@@ -787,6 +810,8 @@ func (h *TikTokHandler) SubmitVideo(c *gin.Context) {
 		"videoTitle":    req.VideoTitle,
 		"thumbnailUrl":  req.ThumbnailURL,
 		"viewCount":     req.ViewCount,
+		"currentViewCount": req.ViewCount,        // ⭐ 추가
+		"estimatedEarnings": estimatedEarnings,   // ⭐ 성과형
 		"likeCount":     req.LikeCount,
 		"commentCount":  req.CommentCount,
 		"shareCount":    req.ShareCount,
@@ -839,4 +864,18 @@ func (h *TikTokHandler) SubmitVideo(c *gin.Context) {
 		"message":      "Video submitted successfully",
 		"submissionId": submissionRef.ID,
 	})
+}
+
+// getTikTokInt64 - 데이터에서 int64 추출
+func getTikTokInt64(data map[string]interface{}, key string) int64 {
+	switch v := data[key].(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	default:
+		return 0
+	}
 }

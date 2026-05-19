@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/robfig/cron/v3"
+	"gorm.io/driver/postgres"
 	"google.golang.org/api/option"
 	"gorm.io/gorm"
 
@@ -60,6 +61,14 @@ func main() {
 
 	// 핸들러 설정
 	setupHandlers(r, db)
+
+	// ⭐ Root path - API 서버 정보
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"service": "AdTown API",
+			"status":  "running",
+		})
+	})
 
 	// Health Check
 	r.GET("/health", func(c *gin.Context) {
@@ -113,28 +122,100 @@ func getPort() string {
 	return "8080"
 }
 
-// initDB initializes the database
+// initDB initializes the database (PostgreSQL via Cloud SQL or fallback SQLite)
 func initDB() (*gorm.DB, error) {
-	var dbPath string
+	var db *gorm.DB
+	var err error
 
-	if config.Config != nil {
-		dbPath = config.GetDatabasePath()
-	} else {
-		dbPath = "adfit.db"
+	// PostgreSQL DSN 구성
+	dsn := buildPostgresDSN()
+	if dsn != "" {
+		db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+		if err != nil {
+			log.Printf("⚠️ PostgreSQL 연결 실패, SQLite로 폴백: %v", err)
+			dsn = ""
+		} else {
+			log.Println("✅ PostgreSQL 연결 성공")
+		}
 	}
 
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
-	if err != nil {
-		return nil, err
+	// SQLite 폴백 (로컬 개발용)
+	if dsn == "" {
+		dbPath := config.GetDatabasePath()
+		db, err = gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("✅ SQLite 연결 성공: %s", dbPath)
 	}
 
-	// Auto Migrate
 	if err := db.AutoMigrate(&models.UserToken{}); err != nil {
 		return nil, err
 	}
 
-	log.Printf("Database initialized at: %s", dbPath)
+	// ⭐ 크리에이터 풀 카테고리/등급/채널 스키마 (Firestore → Cloud SQL 이전)
+	if err := db.AutoMigrate(
+		&models.CategoryPrimary{},
+		&models.CategorySecondary{},
+		&models.CategorySecondaryMapping{},
+		&models.CategoryCreator{},
+		&models.CategoryMeta{},
+		&models.FollowerTier{},
+		&models.ChannelMaster{},
+	); err != nil {
+		return nil, err
+	}
+
+	// follower_tier / category_meta 기본 시드 (멱등) — 실패해도 서버는 기동
+	if err := models.SeedCategoryDefaults(db); err != nil {
+		log.Printf("⚠️ 카테고리 기본 시드 실패: %v", err)
+	}
+
 	return db, nil
+}
+
+// buildPostgresDSN builds PostgreSQL DSN
+// Cloud Run: CLOUD_SQL_INSTANCE 환경변수 설정 시 Unix Socket 사용
+// 로컬: DB_HOST, DB_USER, DB_PASSWORD, DB_NAME 환경변수 사용
+func buildPostgresDSN() string {
+	var user, password, dbname string
+
+	if config.Config != nil {
+		user = config.Config.Database.User
+		password = config.Config.Database.Password
+		dbname = config.Config.Database.DBName
+	}
+	// 환경변수 우선
+	if v := os.Getenv("DB_USER"); v != "" { user = v }
+	if v := os.Getenv("DB_PASSWORD"); v != "" { password = v }
+	if v := os.Getenv("DB_NAME"); v != "" { dbname = v }
+
+	if user == "" || dbname == "" {
+		return ""
+	}
+
+	// Cloud Run + Cloud SQL Auth Proxy: Unix Socket
+	instance := os.Getenv("CLOUD_SQL_INSTANCE")
+	if instance == "" && config.Config != nil {
+		instance = config.Config.Database.Instance
+	}
+	if instance != "" {
+		socketDir := "/cloudsql"
+		return fmt.Sprintf("host=%s/%s user=%s password=%s dbname=%s sslmode=disable",
+			socketDir, instance, user, password, dbname)
+	}
+
+	// 로컬 / TCP 연결
+	host := "localhost"
+	port := 5432
+	if config.Config != nil {
+		if config.Config.Database.Host != "" { host = config.Config.Database.Host }
+		if config.Config.Database.Port != 0 { port = config.Config.Database.Port }
+	}
+	if v := os.Getenv("DB_HOST"); v != "" { host = v }
+
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+		host, port, user, password, dbname)
 }
 
 // setupCORS configures CORS middleware
@@ -193,11 +274,23 @@ func setupHandlers(r *gin.Engine, db *gorm.DB) {
 	// YouTube routes
 	setupYouTubeRoutes(r, db)
 
+	// YouTube Trend routes
+	setupYouTubeTrendRoutes(r)
+
 	// Instagram routes
 	setupInstagramRoutes(r, db)
 
 	// Admin routes
-	setupAdminRoutes(r)
+	setupAdminRoutes(r, db)
+
+	// Image proxy (CORS 우회)
+	r.GET("/api/image/proxy", handlers.ImageProxy)
+
+	// Creator Pool routes
+	setupCreatorPoolRoutes(r, db)
+
+	// Category / FollowerTier / Channel routes (Cloud SQL)
+	setupCategoryRoutes(r, db)
 
 	// Report routes
 	setupReportRoutes(r)
@@ -213,8 +306,16 @@ func setupHandlers(r *gin.Engine, db *gorm.DB) {
 	}
 	setupTikTokCronRoutes(r, tiktokCronHandler)
 
+	// ⭐ Instagram Cron routes
+	instagramCronHandler, err := handlers.NewInstagramCronHandler()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize Instagram Cron handler: %v", err)
+		instagramCronHandler = nil
+	}
+	setupInstagramCronRoutes(r, instagramCronHandler)
+
 	// ⭐ Cron 스케줄러에 동일한 핸들러 전달
-	go startTestCron(tiktokCronHandler)
+	go startTestCron(tiktokCronHandler, instagramCronHandler)
 
 	log.Println("All handlers configured")
 }
@@ -313,9 +414,11 @@ func setupInstagramRoutes(r *gin.Engine, db *gorm.DB) {
 	{
 		public.GET("/auth", instagramHandler.GetAuthURL)
 		public.GET("/callback", instagramHandler.HandleCallback)
-		// Facebook 정책 필수 엔드포인트
+		// Facebook 정책 필수 엔드포인트 (POST: 실제 요청, GET: 상태 확인용)
 		public.POST("/data-deletion", instagramHandler.DataDeletion)
+		public.GET("/data-deletion", instagramHandler.DataDeletionStatus)
 		public.POST("/deauthorize", instagramHandler.Deauthorize)
+		public.GET("/deauthorize", instagramHandler.DeauthorizeStatus)
 		// 테스트용 엔드포인트 (PowerShell 테스트)
 		public.GET("/test/user", instagramHandler.TestGetUser)
 		public.GET("/test/media", instagramHandler.TestGetMedia)
@@ -344,12 +447,15 @@ func setupInstagramRoutes(r *gin.Engine, db *gorm.DB) {
 }
 
 // setupAdminRoutes sets up admin routes
-func setupAdminRoutes(r *gin.Engine) {
+func setupAdminRoutes(r *gin.Engine, db *gorm.DB) {
 	adminHandler, err := handlers.NewAdminStatsHandler()
 	if err != nil {
 		log.Printf("Warning: Failed to initialize admin handler: %v", err)
 		return
 	}
+
+	// ⭐ 크리에이터 풀 핸들러 (Cloud SQL)
+	creatorPoolHandler := handlers.NewCreatorPoolHandler(db)
 
 	// Admin routes
 	adminGroup := r.Group("/api/admin")
@@ -368,8 +474,18 @@ func setupAdminRoutes(r *gin.Engine) {
 		// 대회 리포트 생성
 		adminGroup.POST("/competitions/:competitionId/generate-report", adminHandler.GenerateReport)
 
+		// ⭐ Mock 리포트 데이터 (테스트 전용)
+		adminGroup.POST("/competitions/:competitionId/inject-mock-report", adminHandler.InjectMockReport)
+		adminGroup.POST("/competitions/:competitionId/cleanup-mock-report", adminHandler.CleanupMockReport)
+		adminGroup.GET("/competitions/:competitionId/has-real-data", adminHandler.CheckMockData)
+
 		// ⭐ 상금 입금 완료 처리
 		adminGroup.POST("/competitions/:competitionId/prize/complete/:userId", adminHandler.CompletePrizePayment)
+
+		// ⭐ 크리에이터 데이터 API (Cloud SQL)
+		adminGroup.GET("/creators", creatorPoolHandler.GetCreators)
+		adminGroup.GET("/creators/stats", creatorPoolHandler.GetCreatorStats)
+		adminGroup.GET("/creators/search", creatorPoolHandler.GetCreators)
 	}
 
 	log.Println("Admin routes configured")
@@ -431,7 +547,7 @@ func setupReportRoutes(r *gin.Engine) {
 }
 
 // startTestCron starts the cron scheduler for competition status checks
-func startTestCron(tiktokCronHandler *handlers.TikTokCronHandler) {
+func startTestCron(tiktokCronHandler *handlers.TikTokCronHandler, instagramCronHandler *handlers.InstagramCronHandler) {
 	log.Println("Starting cron scheduler...")
 
 	statsService, err := services.NewStatsService()
@@ -458,6 +574,12 @@ func startTestCron(tiktokCronHandler *handlers.TikTokCronHandler) {
 		if tiktokCronHandler != nil {
 			log.Println("🚀 [서버 시작] TikTok 통계 초기 업데이트...")
 			tiktokCronHandler.UpdateTikTokStatsInternal()
+		}
+
+		// 4. ⭐ Instagram 통계 업데이트 (서버 시작 시 1회)
+		if instagramCronHandler != nil {
+			log.Println("🚀 [서버 시작] Instagram 통계 초기 업데이트...")
+			instagramCronHandler.UpdateInstagramStatsInternal()
 		}
 	}()
 
@@ -486,6 +608,12 @@ func startTestCron(tiktokCronHandler *handlers.TikTokCronHandler) {
 		if tiktokCronHandler != nil {
 			log.Println("🔄 [Hourly] TikTok 통계 업데이트...")
 			tiktokCronHandler.UpdateTikTokStatsInternal()
+		}
+
+		// ⭐ Instagram 통계 업데이트
+		if instagramCronHandler != nil {
+			log.Println("🔄 [Hourly] Instagram 통계 업데이트...")
+			instagramCronHandler.UpdateInstagramStatsInternal()
 		}
 	})
 
@@ -556,6 +684,131 @@ func initFirestoreClient() (*firestore.Client, error) {
 	return firestoreClient, nil
 }
 
+// setupYouTubeTrendRoutes sets up YouTube Trend API routes
+func setupYouTubeTrendRoutes(r *gin.Engine) {
+	trendHandler, err := handlers.NewYouTubeTrendHandler()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize YouTube Trend handler: %v", err)
+		return
+	}
+
+	// Public routes (API Key 기반)
+	trendGroup := r.Group("/api/youtube-trend")
+	{
+		trendGroup.GET("/search", trendHandler.Search)
+		trendGroup.GET("/trending", trendHandler.Trending)
+		trendGroup.GET("/topic", trendHandler.TopicAnalysis)
+		trendGroup.GET("/viral", trendHandler.Viral)
+	}
+
+	log.Println("YouTube Trend routes configured")
+}
+
+// setupCreatorPoolRoutes sets up creator pool routes
+func setupCreatorPoolRoutes(r *gin.Engine, db *gorm.DB) {
+	if db == nil {
+		log.Println("Warning: DB is nil, skipping creator pool routes")
+		return
+	}
+
+	h := handlers.NewCreatorPoolHandler(db)
+
+	// 브랜드용 (Firebase Auth)
+	protected := r.Group("/api/creators")
+	protected.Use(middleware.FirebaseAuthRequired())
+	{
+		protected.GET("", h.GetCreators)
+		protected.GET("/saved", h.GetSavedCreators)
+		protected.POST("/save", h.SaveCreator)
+		protected.DELETE("/save", h.RemoveCreator)
+	}
+
+	log.Println("Creator Pool routes configured")
+}
+
+// setupCategoryRoutes sets up category / follower-tier / channel routes (Cloud SQL)
+func setupCategoryRoutes(r *gin.Engine, db *gorm.DB) {
+	if db == nil {
+		log.Println("Warning: DB is nil, skipping category routes")
+		return
+	}
+
+	h := handlers.NewCategoryHandler(db)
+
+	// Admin (Admin Token)
+	admin := r.Group("/api/admin")
+	admin.Use(middleware.AdminAuthRequired())
+	{
+		admin.GET("/categories", h.GetCategoryTree)
+		admin.POST("/categories/primary", h.CreatePrimary)
+		admin.PUT("/categories/primary", h.UpdatePrimary)
+		admin.DELETE("/categories/primary", h.DeletePrimary)
+		admin.POST("/categories/secondary", h.CreateSecondary)
+		admin.PUT("/categories/secondary", h.UpdateSecondary)
+		admin.DELETE("/categories/secondary", h.DeleteSecondary)
+		admin.PUT("/categories/secondary/:code/mapping", h.SetSecondaryMapping)
+		admin.POST("/categories/recompute-creator-categories", h.RecomputeCreatorCategories)
+		admin.POST("/categories/migrate-from-firestore", h.MigrateFromFirestore)
+
+		admin.GET("/follower-tiers", h.ListFollowerTiers)
+		admin.POST("/follower-tiers", h.CreateFollowerTier)
+		admin.PUT("/follower-tiers", h.UpdateFollowerTier)
+		admin.DELETE("/follower-tiers", h.DeleteFollowerTier)
+
+		admin.GET("/channels", h.ListChannels)
+		admin.POST("/channels", h.CreateChannel)
+		admin.PUT("/channels", h.UpdateChannel)
+		admin.DELETE("/channels", h.DeleteChannel)
+	}
+
+	// Consumer (Firebase Auth) — brand 공용
+	pub := r.Group("/api")
+	pub.Use(middleware.FirebaseAuthRequired())
+	{
+		pub.GET("/categories", h.GetCategoryTree)
+		pub.GET("/follower-tiers", h.ListFollowerTiers)
+	}
+
+	log.Println("Category routes configured")
+}
+
+// setupInstagramCronRoutes sets up Instagram Cron routes
+func setupInstagramCronRoutes(r *gin.Engine, instagramCronHandler *handlers.InstagramCronHandler) {
+	if instagramCronHandler == nil {
+		log.Println("Warning: Instagram Cron handler is nil, skipping routes")
+		return
+	}
+
+	cronGroup := r.Group("/api/cron/instagram")
+	cronGroup.Use(func(c *gin.Context) {
+		token := c.GetHeader("X-Cron-Token")
+		if token == "" {
+			token = c.GetHeader("Authorization")
+			if token != "" && len(token) > 7 && token[:7] == "Bearer " {
+				token = token[7:]
+			}
+		}
+
+		expectedToken := os.Getenv("CRON_SECRET_TOKEN")
+		if expectedToken == "" {
+			expectedToken = "adfit-cron-secret-2025"
+			log.Println("⚠️  [SECURITY] CRON_SECRET_TOKEN 환경변수가 설정되지 않았습니다. 기본값이 사용됩니다 - Cloud Run 환경변수에 CRON_SECRET_TOKEN을 변경하세요")
+		}
+
+		if token != expectedToken {
+			c.AbortWithStatusJSON(401, gin.H{"error": "Unauthorized"})
+			return
+		}
+		c.Next()
+	})
+	{
+		cronGroup.POST("/update-stats", instagramCronHandler.UpdateInstagramStats)
+		cronGroup.POST("/cleanup-tokens", instagramCronHandler.CleanupExpiredTokens)
+	}
+
+	log.Println("Instagram Cron routes configured")
+}
+
 // setupTikTokCronRoutes sets up TikTok Cron routes
 func setupTikTokCronRoutes(r *gin.Engine, tiktokCronHandler *handlers.TikTokCronHandler) {
 	if tiktokCronHandler == nil {
@@ -577,7 +830,8 @@ func setupTikTokCronRoutes(r *gin.Engine, tiktokCronHandler *handlers.TikTokCron
 		// 환경변수에서 CRON_SECRET_TOKEN 확인
 		expectedToken := os.Getenv("CRON_SECRET_TOKEN")
 		if expectedToken == "" {
-			expectedToken = "adfit-cron-secret-2025" // 기본값
+			expectedToken = "adfit-cron-secret-2025" // 기본값 ⚠️ CRON_SECRET_TOKEN 환경변수를 반드시 설정하세요
+			log.Println("⚠️  [SECURITY] CRON_SECRET_TOKEN 환경변수가 설정되지 않았습니다. 기본값이 사용됩니다 - Cloud Run 환경변수에 CRON_SECRET_TOKEN을 변경하세요")
 		}
 		
 		if token != expectedToken {

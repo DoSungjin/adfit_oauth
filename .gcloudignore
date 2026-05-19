@@ -17,11 +17,15 @@ config_youtube.yaml
 adfit.db
 
 # 민감 정보
-*.json
 service-account-key.json
 credentials.json
 *.pem
 *.key
+
+# 설정 JSON은 제외하되, db/Creator_Data는 포함
+!db/
+!db/Creator_Data/
+!db/Creator_Data/*.json
 
 # 로그 파일
 logs/

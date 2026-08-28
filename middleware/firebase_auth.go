@@ -27,14 +27,17 @@ func InitFirebaseAuth() error {
 				ProjectID: config.Config.Firebase.ProjectID,
 			}, option.WithCredentialsFile(config.Config.Firebase.CredentialsPath))
 		} else {
+			// 자격증명 없는 환경(AWS EC2): ID 토큰 검증은 구글 공개 인증서만 쓰므로
+			// WithoutAuthentication 으로 초기화한다. VerifyIDToken 은 정상 동작하고,
+			// 유저 관리 API(CreateUser 등)만 불가 — 이 미들웨어는 검증 전용이라 무관.
 			app, err = firebase.NewApp(ctx, &firebase.Config{
 				ProjectID: config.Config.Firebase.ProjectID,
-			})
+			}, option.WithoutAuthentication())
 		}
 	} else {
 		app, err = firebase.NewApp(ctx, &firebase.Config{
 			ProjectID: "posted-app-c4ff5",
-		})
+		}, option.WithoutAuthentication())
 	}
 
 	if err != nil {

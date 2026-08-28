@@ -13,19 +13,24 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"adfit-oauth/models"
 )
 
 type CreatorPoolHandler struct {
 	DB *gorm.DB
+	sl *SaveListHandler // 호환 라우팅용 (SaveCreator/RemoveCreator/GetSavedCreators → 새 테이블)
 }
 
 // ytImageClient - YouTube API 이미지 요청 전용 클라이언트 (timeout 설정)
 var ytImageClient = &http.Client{Timeout: 10 * time.Second}
 
 func NewCreatorPoolHandler(db *gorm.DB) *CreatorPoolHandler {
-	return &CreatorPoolHandler{DB: db}
+	return &CreatorPoolHandler{
+		DB: db,
+		sl: NewSaveListHandler(db),
+	}
 }
 
 // Creator - creators 테이블 매핑
@@ -403,7 +408,8 @@ func (h *CreatorPoolHandler) GetCreatorStats(c *gin.Context) {
 	})
 }
 
-// SaveCreator - 즐겨찾기 추가
+// SaveCreator - 즐겨찾기 추가 (deprecated 호환)
+// 새 시스템: 사용자의 기본 리스트에 멤버로 추가
 // POST /api/creators/save
 func (h *CreatorPoolHandler) SaveCreator(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -427,15 +433,91 @@ func (h *CreatorPoolHandler) SaveCreator(c *gin.Context) {
 		return
 	}
 
-	sql := `
-		INSERT INTO creator_saved (user_id, platform, handle, name, profile_image, category, followers, platform_url, memo)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (user_id, platform, handle) DO UPDATE SET memo = EXCLUDED.memo, saved_at = NOW()
-	`
-	if err := h.DB.Exec(sql,
-		userID, req.Platform, req.Handle, req.Name,
-		req.ProfileImage, req.Category, req.Followers, req.PlatformURL, req.Memo,
-	).Error; err != nil {
+	// 기본 리스트 보장 (생성되면 legacy 1회 이관)
+	defaultList, created, err := h.sl.ensureDefaultList(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if created {
+		if mErr := h.sl.migrateLegacySaved(userID, defaultList.ID); mErr != nil {
+			log.Printf("⚠️ legacy 마이그레이션 실패: %v", mErr)
+		}
+	}
+
+	// creators 매칭 또는 신규 추가 (source='manual')
+	type idOnly struct {
+		ID int `gorm:"column:id"`
+	}
+	var found idOnly
+	err = h.DB.Table("creators").
+		Select("id").
+		Where("platform = ? AND handle = ?", req.Platform, req.Handle).
+		Take(&found).Error
+
+	creatorID := found.ID
+	if err == gorm.ErrRecordNotFound || creatorID == 0 {
+		now := time.Now()
+		insertRow := map[string]interface{}{
+			"platform":      req.Platform,
+			"handle":        req.Handle,
+			"name":          req.Name,
+			"profile_image": req.ProfileImage,
+			"category":      req.Category,
+			"followers":     req.Followers,
+			"platform_url":  req.PlatformURL,
+			"source":        "manual",
+			"discovered_at": now,
+		}
+		if err := h.DB.Table("creators").Create(insertRow).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		var newID idOnly
+		if e := h.DB.Table("creators").
+			Select("id").
+			Where("platform = ? AND handle = ?", req.Platform, req.Handle).
+			Take(&newID).Error; e != nil || newID.ID == 0 {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "크리에이터 ID 확보 실패"})
+			return
+		}
+		creatorID = newID.ID
+	} else if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 100명 한도 체크 (이미 멤버이면 추가 안 일어나니 OK)
+	var memberCount int64
+	h.DB.Model(&models.CreatorSaveListMember{}).
+		Session(&gorm.Session{}).
+		Where("list_id = ?", defaultList.ID).
+		Count(&memberCount)
+
+	var alreadyMember int64
+	h.DB.Model(&models.CreatorSaveListMember{}).
+		Session(&gorm.Session{}).
+		Where("list_id = ? AND creator_id = ?", defaultList.ID, creatorID).
+		Count(&alreadyMember)
+
+	if alreadyMember == 0 && memberCount >= MaxMembersPerList {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": fmt.Sprintf("기본 리스트가 이미 %d명에 도달했습니다", MaxMembersPerList),
+			"code":  "member_limit_exceeded",
+		})
+		return
+	}
+
+	// 멤버 추가 (PK 중복 시 memo만 업데이트 = 멱등)
+	member := models.CreatorSaveListMember{
+		ListID:    defaultList.ID,
+		CreatorID: creatorID,
+		Memo:      req.Memo,
+	}
+	if err := h.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "list_id"}, {Name: "creator_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"memo"}),
+	}).Create(&member).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -443,7 +525,8 @@ func (h *CreatorPoolHandler) SaveCreator(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// RemoveCreator - 즐겨찾기 제거
+// RemoveCreator - 즐겨찾기 제거 (deprecated 호환)
+// 새 시스템: 기본 리스트에서 (platform, handle) 매칭 멤버 삭제 (멱등)
 // DELETE /api/creators/save
 func (h *CreatorPoolHandler) RemoveCreator(c *gin.Context) {
 	userID := c.GetString("user_id")
@@ -455,25 +538,59 @@ func (h *CreatorPoolHandler) RemoveCreator(c *gin.Context) {
 		return
 	}
 
-	result := h.DB.Exec(
-		"DELETE FROM creator_saved WHERE user_id = ? AND platform = ? AND handle = ?",
-		userID, platform, handle,
-	)
-	if result.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": result.Error.Error()})
+	// 기본 리스트 (없으면 삭제할 것도 없음 → 멱등 성공)
+	var defaultList models.CreatorSaveList
+	if err := h.DB.Where("user_id = ? AND is_default = ?", userID, true).
+		First(&defaultList).Error; err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": true})
 		return
 	}
+
+	// creators.id 매칭 (없으면 멱등 성공)
+	type idOnly struct {
+		ID int `gorm:"column:id"`
+	}
+	var found idOnly
+	err := h.DB.Table("creators").
+		Select("id").
+		Where("platform = ? AND handle = ?", platform, handle).
+		Take(&found).Error
+	if err == gorm.ErrRecordNotFound || found.ID == 0 {
+		c.JSON(http.StatusOK, gin.H{"success": true})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 기본 리스트에서 멤버 삭제 (없어도 OK)
+	h.DB.Where("list_id = ? AND creator_id = ?", defaultList.ID, found.ID).
+		Delete(&models.CreatorSaveListMember{})
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// GetSavedCreators - 즐겨찾기 목록
+// GetSavedCreators - 즐겨찾기 목록 (deprecated 호환)
+// 새 시스템: 기본 리스트 멤버 JOIN creators, 기존 응답 스키마 유지
 // GET /api/creators/saved
 func (h *CreatorPoolHandler) GetSavedCreators(c *gin.Context) {
 	userID := c.GetString("user_id")
 	if userID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
+	}
+
+	// 기본 리스트 lazy 보장 + legacy 마이그레이션
+	defaultList, created, err := h.sl.ensureDefaultList(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if created {
+		if mErr := h.sl.migrateLegacySaved(userID, defaultList.ID); mErr != nil {
+			log.Printf("⚠️ legacy 마이그레이션 실패: %v", mErr)
+		}
 	}
 
 	type SavedCreator struct {
@@ -490,10 +607,28 @@ func (h *CreatorPoolHandler) GetSavedCreators(c *gin.Context) {
 	}
 
 	var saved []SavedCreator
-	h.DB.Table("creator_saved").
-		Where("user_id = ?", userID).
-		Order("saved_at DESC").
-		Find(&saved)
+	err = h.DB.Raw(`
+		SELECT
+		  CAST(m.creator_id AS TEXT)            AS id,
+		  c.platform                            AS platform,
+		  COALESCE(c.handle,'')                 AS handle,
+		  COALESCE(c.name,'')                   AS name,
+		  COALESCE(c.profile_image,'')          AS profile_image,
+		  COALESCE(c.category,'')               AS category,
+		  COALESCE(c.followers,0)               AS followers,
+		  COALESCE(c.platform_url,'')           AS platform_url,
+		  COALESCE(m.memo,'')                   AS memo,
+		  COALESCE(CAST(m.added_at AS TEXT),'') AS saved_at
+		FROM creator_save_list_member m
+		INNER JOIN creators c ON c.id = m.creator_id
+		WHERE m.list_id = ?
+		ORDER BY m.added_at DESC, m.creator_id DESC
+	`, defaultList.ID).Scan(&saved).Error
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"data": saved})
 }

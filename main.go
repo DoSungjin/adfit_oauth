@@ -171,6 +171,19 @@ func initDB() (*gorm.DB, error) {
 		log.Printf("⚠️ 카테고리 기본 시드 실패: %v", err)
 	}
 
+	// ⭐ 내 크리에이터 풀 관리 (정규화 리스트 + 멤버 조인)
+	if err := db.AutoMigrate(
+		&models.CreatorSaveList{},
+		&models.CreatorSaveListMember{},
+	); err != nil {
+		return nil, err
+	}
+
+	// ⭐ creators 보조 컬럼 (channel_id / source / discovered_at / last_seen_at)
+	if err := models.MigrateCreatorAuxColumns(db); err != nil {
+		log.Printf("⚠️ creators 보조 컬럼 마이그레이션 실패: %v", err)
+	}
+
 	return db, nil
 }
 
@@ -214,8 +227,12 @@ func buildPostgresDSN() string {
 	}
 	if v := os.Getenv("DB_HOST"); v != "" { host = v }
 
-	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-		host, port, user, password, dbname)
+	// AWS RDS 는 비암호화 접속을 거부한다(pg_hba "no encryption") — EC2 배포는 DB_SSLMODE=require
+	sslmode := "disable"
+	if v := os.Getenv("DB_SSLMODE"); v != "" { sslmode = v }
+
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		host, port, user, password, dbname, sslmode)
 }
 
 // setupCORS configures CORS middleware
@@ -486,6 +503,7 @@ func setupAdminRoutes(r *gin.Engine, db *gorm.DB) {
 		adminGroup.GET("/creators", creatorPoolHandler.GetCreators)
 		adminGroup.GET("/creators/stats", creatorPoolHandler.GetCreatorStats)
 		adminGroup.GET("/creators/search", creatorPoolHandler.GetCreators)
+		adminGroup.GET("/creators/analytics", creatorPoolHandler.GetCreatorAnalytics)
 	}
 
 	log.Println("Admin routes configured")
@@ -712,6 +730,7 @@ func setupCreatorPoolRoutes(r *gin.Engine, db *gorm.DB) {
 	}
 
 	h := handlers.NewCreatorPoolHandler(db)
+	sh := handlers.NewSaveListHandler(db)
 
 	// 브랜드용 (Firebase Auth)
 	protected := r.Group("/api/creators")
@@ -721,6 +740,18 @@ func setupCreatorPoolRoutes(r *gin.Engine, db *gorm.DB) {
 		protected.GET("/saved", h.GetSavedCreators)
 		protected.POST("/save", h.SaveCreator)
 		protected.DELETE("/save", h.RemoveCreator)
+
+		// ⭐ 내 크리에이터 리스트 관리
+		protected.GET("/lists", sh.GetSaveLists)
+		protected.POST("/lists", sh.CreateSaveList)
+		protected.PUT("/lists/:id", sh.UpdateSaveList)
+		protected.DELETE("/lists/:id", sh.DeleteSaveList)
+
+		// ⭐ 리스트 멤버 관리 (creators JOIN 으로 최신 정보 반환)
+		protected.GET("/lists/:id/members", sh.GetMembers)
+		protected.POST("/lists/:id/members", sh.AddMember)
+		protected.POST("/lists/:id/members/bulk-add", sh.BulkAddMembers)
+		protected.DELETE("/lists/:id/members/:creatorId", sh.RemoveMember)
 	}
 
 	log.Println("Creator Pool routes configured")
